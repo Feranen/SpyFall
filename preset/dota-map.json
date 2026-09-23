@@ -1,0 +1,29 @@
+{
+  "name": "Dota 2: Map Locations",
+  "items": [
+    "Roshan Pit", "Radiant Fountain", "Dire Fountain", "Secret Shop", "Tormentor Spawn", 
+    "Mid Lane", "Safe Lane", "Off Lane", "Radiant Ancient", "Dire Ancient", 
+    "Lotus Pool", "Twin Gate", "Watcher", "Rune Spot (Power)", "Rune Spot (Bounty)", 
+    "Radiant Jungle", "Dire Jungle", "Outpost"
+  ],
+  "facts": {
+    "Roshan Pit": "Dota Map | Neutral boss pit containing Aegis of the Immortal, Cheese, and Refresher Shard.",
+    "Radiant Fountain": "Dota Map | Home spawn for Radiant team with ultra-high HP regen and high-damage laser turret.",
+    "Dire Fountain": "Dota Map | Home spawn for Dire team with ultra-high HP regen and high-damage laser turret.",
+    "Secret Shop": "Dota Map | Neutral shop in the jungle selling high-tier combination items.",
+    "Tormentor Spawn": "Dota Map | Powerful stationary shield boss spawning at 20:00 granting Aghanim's Shard.",
+    "Mid Lane": "Dota Map | Central lane where 1v1 matchup takes place and power runes spawn.",
+    "Safe Lane": "Dota Map | Long lane protected by friendly jungle where Carry hero usually farms.",
+    "Off Lane": "Dota Map | Hard lane near enemy jungle where tanky Offlaner attempts to disrupt carry.",
+    "Radiant Ancient": "Dota Map | Main structure of Radiant base; destroying it wins the game.",
+    "Dire Ancient": "Dota Map | Main structure of Dire base; destroying it wins the game.",
+    "Lotus Pool": "Dota Map | Edge-of-map structure generating Healing Lotuses over time.",
+    "Twin Gate": "Dota Map | Portals located at top/bottom corners allowing instant teleportation across map.",
+    "Watcher": "Dota Map | Capturable neutral structures providing vision over key areas when activated.",
+    "Rune Spot (Power)": "Dota Map | River spots spawning Double Damage, Haste, Arcane, Invisibility, or Shield runes.",
+    "Rune Spot (Bounty)": "Dota Map | Designated spots spawning Bounty Runes that grant gold to entire team.",
+    "Radiant Jungle": "Dota Map | Lush green forest containing neutral creep camps and stackable camps.",
+    "Dire Jungle": "Dota Map | Corrupted dark forest containing neutral creep camps and high ground cliffs.",
+    "Outpost": "Dota Map | Capturable objective providing teleport point and vision."
+  }
+}

@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dota 2 Spyfall - Serverless Multiplayer & Accounts</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script src="app.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <div class="container">
+        <!-- TOP SERVERLESS ACCOUNT HEADER BAR -->
+        <div class="account-bar" onclick="openAccountModal()">
+            <div class="account-info">
+                <div class="account-avatar" id="bar-avatar">⚔️</div>
+                <div>
+                    <div class="account-name" id="bar-username">Player</div>
+                    <div class="account-level-badge" id="bar-level">Level 1</div>
+                </div>
+            </div>
+            <div style="font-size: 0.8rem; color: var(--accent-gold);">⚙️ Profile</div>
+        </div>
+
+        <h1>Spyfall</h1>
+        <div class="subtitle">Multiplayer Dota 2 Edition</div>
+
+        <!-- WELCOME / MULTIPLAYER JOIN SCREEN -->
+        <div id="screen-welcome" class="screen active">
+            <div class="form-group">
+                <label for="player-name">Your Display Name</label>
+                <input type="text" id="player-name" placeholder="e.g. Dendi" maxlength="12"
+                    onchange="updateAccountName(this.value)">
+            </div>
+
+            <button class="btn btn-green" onclick="createRoom()">Host New Game</button>
+
+            <div id="reconnect-box" style="display: none; margin-top: 10px;">
+                <button class="btn btn-purple" id="reconnect-btn" onclick="reconnectLastRoom()">⚡ Reconnect to Room
+                    (<span id="reconnect-code">----</span>)</button>
+            </div>
+
+            <div style="margin: 15px 0; color: var(--text-dim); font-size: 0.85rem;">— OR JOIN A ROOM —</div>
+
+            <div class="form-group">
+                <input type="text" id="join-code-input" class="code-input" placeholder="ROOM CODE" maxlength="5">
+            </div>
+
+            <button class="btn btn-blue" id="join-btn" onclick="joinRoom()">Join Game</button>
+
+            <div class="connection-status" id="net-status">Status: Disconnected</div>
+        </div>
+
+        <!-- LOBBY SCREEN -->
+        <div id="screen-lobby" class="screen">
+            <div>ROOM CODE</div>
+            <div class="room-tag" id="lobby-room-code">----</div>
+
+            <div class="player-list" id="lobby-player-list"></div>
+
+            <!-- HOST CONTROLS ONLY -->
+            <div id="host-settings" style="display: none;">
+                <div class="form-group">
+                    <label for="spy-count">Number of Spies</label>
+                    <input type="number" id="spy-count" min="1" max="3" value="1">
+                </div>
+
+                <label class="checkbox-group">
+                    <input type="checkbox" id="enable-impostor" checked>
+                    <div>
+                        <strong style="color: var(--accent-purple);">Enable Impostor Role</strong>
+                        <div style="font-size: 0.75rem; color: var(--text-dim);">Knows target, wins by getting an
+                            innocent voted out!</div>
+                    </div>
+                </label>
+
+                <div class="form-group">
+                    <label for="round-time">Timer (Minutes)</label>
+                    <input type="number" id="round-time" min="1" max="15" value="6">
+                </div>
+
+                <div class="form-group">
+                    <label for="preset-select">Word Pack Preset</label>
+                    <select id="preset-select"></select>
+
+                    <div class="btn-row">
+                        <button class="btn btn-purple" onclick="openPresetModal()">➕ Preset Creator</button>
+                        <button class="btn btn-blue" onclick="triggerImportFile()">📥 Import JSON</button>
+                        <button class="btn btn-secondary" onclick="exportSelectedPreset()">📤 Export</button>
+                    </div>
+                    <input type="file" id="preset-file-input" accept=".json" style="display: none;"
+                        onchange="importPresetFile(event)">
+                </div>
+
+                <button class="btn btn-green" onclick="hostStartGame()">Start Match</button>
+            </div>
+
+            <div id="client-waiting"
+                style="display: none; color: var(--accent-gold); font-size: 0.9rem; margin-top: 15px;">
+                ⏳ Waiting for room host to configure and start...
+            </div>
+        </div>
+
+        <!-- MAIN GAME / ROLE SCREEN -->
+        <div id="screen-game" class="screen">
+            <div class="starter-info">
+                🎲 First Questioner: <strong><span id="first-player">Player</span></strong>
+            </div>
+
+            <div class="card-box">
+                <button class="btn btn-secondary" id="toggle-role-btn" onclick="toggleRoleVisibility()"
+                    style="margin-bottom: 10px; width: auto; padding: 6px 12px;">👁️ Reveal My Secret Role</button>
+
+                <div id="role-card-hidden" style="color: var(--text-dim); font-size: 0.85rem;">
+                    Card Hidden (Tap button above to view)
+                </div>
+
+                <div id="role-card-content" style="display: none; width: 100%;">
+                    <div class="role-title" id="role-title">SECRET ROLE</div>
+                    <div class="role-value" id="role-value">???</div>
+                    <div class="facts-box" id="facts-box">
+                        <div id="facts-content">...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="timer" id="timer-display">06:00</div>
+
+            <div id="host-game-controls" style="display: none; gap: 8px; margin-top: 5px;">
+                <button class="btn btn-secondary" onclick="hostToggleTimer()" id="pause-btn">Pause</button>
+                <button class="btn btn-green" onclick="hostStartVoting()">🗳️ Start Voting</button>
+                <button class="btn" style="background: #555;" onclick="hostEndGame()">End Round (No Vote)</button>
+            </div>
+
+            <div style="margin-top: 10px; text-align: left;">
+                <label>Players Status:</label>
+                <div class="player-list" id="game-roster-status" style="max-height: 100px; margin: 5px 0;"></div>
+            </div>
+
+            <div class="hero-list-container">
+                <label>Possible Targets Pool (Tap for Facts):</label>
+                <div class="hero-grid" id="deck-grid"></div>
+            </div>
+        </div>
+
+        <!-- VOTING SCREEN -->
+        <div id="screen-voting" class="screen">
+            <h2 style="color: var(--accent-gold); margin-bottom: 5px;">🗳️ Accusation & Voting</h2>
+            <div style="color: var(--text-dim); font-size: 0.85rem; margin-bottom: 15px;">
+                Select the player you suspect is the Spy or Impostor!
+            </div>
+
+            <div id="voting-target-list" style="margin: 15px 0;"></div>
+
+            <div id="voting-status"
+                style="margin: 12px 0; font-size: 0.9rem; color: var(--accent-gold); font-weight: bold;">
+                Cast your vote above...
+            </div>
+
+            <div id="host-voting-controls" style="display: none; margin-top: 15px;">
+                <button class="btn btn-green" onclick="hostConcludeVoting()">Tally Votes & Declare Winner</button>
+            </div>
+        </div>
+
+        <!-- REVEAL SCREEN -->
+        <div id="screen-reveal" class="screen">
+            <h2>Round Complete!</h2>
+
+            <div class="card-box">
+                <div id="reveal-winner" style="font-size: 1.6rem; font-weight: bold; margin-bottom: 12px;">WINNER</div>
+
+                <div class="role-title">VOTED OUT PLAYER</div>
+                <div class="role-value" id="reveal-voted-out"
+                    style="font-size: 1.2rem; color: var(--accent-gold); margin-bottom: 12px;">Nobody</div>
+
+                <div class="role-title">THE SECRET TARGET WAS</div>
+                <div class="role-value" id="reveal-target" style="color: var(--accent-gold);">???</div>
+
+                <div class="role-title" style="margin-top: 15px;">SPY(S)</div>
+                <div class="role-value spy" id="reveal-spies" style="font-size: 1.2rem;">???</div>
+
+                <div class="role-title" id="reveal-impostor-title" style="margin-top: 15px; display:none;">IMPOSTOR
+                </div>
+                <div class="role-value impostor" id="reveal-impostor" style="font-size: 1.2rem; display:none;">None
+                </div>
+            </div>
+
+            <div id="xp-gain-notice"
+                style="color: var(--accent-green); font-weight: bold; margin-bottom: 12px; font-size: 0.95rem;">
+                +50 XP Earned!
+            </div>
+
+            <button class="btn btn-green" id="host-return-btn" style="display:none;"
+                onclick="hostReturnToLobby()">Return to Lobby</button>
+            <div id="client-return-msg" style="color: var(--text-dim); font-size: 0.85rem;">Waiting for host...</div>
+        </div>
+    </div>
+
+    <!-- SERVERLESS ACCOUNT MODAL -->
+    <div class="modal" id="account-modal">
+        <div class="modal-content">
+            <div class="modal-title">Serverless Player Account</div>
+            <div style="font-size: 0.75rem; color: var(--text-dim); margin-bottom: 10px;">
+                Stored in LocalStorage & synced via PeerJS WebRTC.
+            </div>
+
+            <div class="form-group">
+                <label>Choose Avatar Icon</label>
+                <div class="avatar-picker" id="avatar-selector"></div>
+            </div>
+
+            <label>Career Level & XP</label>
+            <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--accent-gold);">
+                <span id="account-modal-lvl">Level 1</span>
+                <span id="account-modal-xp">0 / 200 XP</span>
+            </div>
+            <div class="xp-bar-container">
+                <div class="xp-bar-fill" id="account-xp-fill"></div>
+            </div>
+
+            <label>Career Statistics</label>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-games">0</div>
+                    <div class="stat-label">Games Played</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-spy-wins">0</div>
+                    <div class="stat-label">Spy Wins</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-imp-wins">0</div>
+                    <div class="stat-label">Impostor Wins</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-innocent-wins">0</div>
+                    <div class="stat-label">Innocent Wins</div>
+                </div>
+            </div>
+
+            <div class="btn-row" style="margin-top: 15px;">
+                <button class="btn btn-blue" onclick="exportAccountFile()">📤 Export Profile</button>
+                <button class="btn btn-purple" onclick="triggerImportAccount()">📥 Restore Profile</button>
+            </div>
+            <input type="file" id="account-file-input" accept=".json" style="display: none;"
+                onchange="importAccountFile(event)">
+
+            <button class="btn btn-secondary" style="margin-top: 10px;"
+                onclick="closeModal('account-modal')">Close</button>
+        </div>
+    </div>
+
+    <!-- HERO FACTS MODAL -->
+    <div class="modal" id="fact-modal">
+        <div class="modal-content">
+            <div class="modal-title" id="modal-hero-title">Hero Name</div>
+            <div class="modal-text" id="modal-hero-facts">Facts about hero...</div>
+            <button class="btn" onclick="closeModal('fact-modal')">Close</button>
+        </div>
+    </div>
+
+    <!-- CUSTOM PRESET MANAGER MODAL -->
+    <div class="modal" id="preset-modal">
+        <div class="modal-content">
+            <div class="modal-title">Custom Preset Manager</div>
+
+            <div class="form-group">
+                <label for="new-preset-name">Preset Name</label>
+                <input type="text" id="new-preset-name" placeholder="e.g. My Dota Heroes Pack">
+            </div>
+
+            <div class="form-group">
+                <label for="new-preset-items">Items & Facts (One per line)</label>
+                <div style="font-size: 0.75rem; color: var(--text-dim); margin-bottom: 5px;">Format:
+                    <code>Item Name | Optional Fact Text</code></div>
+                <textarea id="new-preset-items" style="height: 120px; font-size: 0.85rem; text-align: left;"
+                    placeholder="Roshan Pit | Neutral boss pit containing Aegis&#10;Kez | Bird warrior with Katana & Sai&#10;Mid Lane"></textarea>
+            </div>
+
+            <button class="btn btn-green" onclick="saveCustomPresetForm()">💾 Save Preset to LocalStorage</button>
+
+            <div style="margin-top: 15px; border-top: 1px solid var(--border-color); padding-top: 10px;">
+                <label>Saved Local Custom Presets:</label>
+                <div class="preset-manage-list" id="saved-preset-list"></div>
+            </div>
+
+            <button class="btn btn-secondary" style="margin-top: 10px;"
+                onclick="closeModal('preset-modal')">Close</button>
+        </div>
+    </div>
+</body>
+
+</html>

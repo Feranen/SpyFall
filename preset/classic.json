@@ -1,0 +1,9 @@
+{
+  "name": "Classic Spyfall Locations",
+  "items": [
+    "Airplane", "Bank", "Beach", "Cathedral", "Circus Tent", "Corporate Party", "Movie Studio", 
+    "Ocean Liner", "Passenger Train", "Pirate Ship", "Polar Station", "Police Station", 
+    "Restaurant", "School", "Service Station", "Space Station", "Submarine", "Supermarket", "Theater"
+  ],
+  "facts": {}
+}
