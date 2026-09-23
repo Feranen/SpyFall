@@ -13,7 +13,7 @@
 <body>
 
     <div class="container">
-        <!-- TOP SERVERLESS ACCOUNT HEADER BAR -->
+        <!-- ACCOUNT HEADER BAR -->
         <div class="account-bar" onclick="openAccountModal()">
             <div class="account-info">
                 <div class="account-avatar" id="bar-avatar">⚔️</div>
@@ -208,8 +208,18 @@
             </div>
 
             <div class="form-group">
-                <label>Choose Avatar Icon</label>
+                <label>Choose Avatar Icon or Custom Picture</label>
                 <div class="avatar-picker" id="avatar-selector"></div>
+
+                <!-- Custom Image Upload Input -->
+                <div style="margin-top: 10px;">
+                    <label for="avatar-file-input">Custom Profile Picture (&lt; 3 MB)</label>
+                    <input type="file" id="avatar-file-input"
+                        accept="image/png, image/jpeg, image/jpg, image/webp, image/gif, image/svg+xml"
+                        onchange="handleAvatarUpload(event)" />
+                    <button class="btn btn-secondary" style="margin-top: 5px; font-size: 0.75rem; padding: 4px;"
+                        onclick="removeCustomAvatar()">Reset to Emoji</button>
+                </div>
             </div>
 
             <label>Career Level & XP</label>
@@ -275,7 +285,8 @@
             <div class="form-group">
                 <label for="new-preset-items">Items & Facts (One per line)</label>
                 <div style="font-size: 0.75rem; color: var(--text-dim); margin-bottom: 5px;">Format:
-                    <code>Item Name | Optional Fact Text</code></div>
+                    <code>Item Name | Optional Fact Text</code>
+                </div>
                 <textarea id="new-preset-items" style="height: 120px; font-size: 0.85rem; text-align: left;"
                     placeholder="Roshan Pit | Neutral boss pit containing Aegis&#10;Kez | Bird warrior with Katana & Sai&#10;Mid Lane"></textarea>
             </div>

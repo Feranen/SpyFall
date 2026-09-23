@@ -133,7 +133,7 @@ function renderAccountUI() {
     const fillPercent = Math.min(100, (currentLvlXp / 200) * 100);
 
     const barAvatar = document.getElementById('bar-avatar');
-    if (barAvatar) barAvatar.innerText = userAccount.avatar;
+    if (barAvatar) barAvatar.innerHTML = renderAvatarHTML(userAccount.avatar);
 
     const barUsername = document.getElementById('bar-username');
     if (barUsername) barUsername.innerText = userAccount.username;
@@ -168,6 +168,57 @@ function updateAccountName(newName) {
         userAccount.username = newName.trim();
         saveAccount();
     }
+}
+
+// Helper to render either a custom Base64 image or a standard Emoji avatar
+function renderAvatarHTML(avatarData) {
+    if (avatarData && avatarData.startsWith('data:image/')) {
+        return `<img src="${avatarData}" alt="Avatar" style="width:100%; height:100%; object-fit:cover; border-radius:50%;" />`;
+    }
+    return avatarData || '⚔️';
+}
+
+// Handle avatar image file uploading with extension and size checks
+function handleAvatarUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    // 1. Check File Size (< 3 MB)
+    const MAX_SIZE_BYTES = 3 * 1024 * 1024; // 3 MB
+    if (file.size > MAX_SIZE_BYTES) {
+        alert("File size exceeds 3 MB limit! Please choose a smaller image.");
+        event.target.value = '';
+        return;
+    }
+
+    // 2. Check Extension and MIME type
+    const allowedExtensions = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'svg'];
+    const fileExtension = file.name.split('.').pop().toLowerCase();
+    const isImageMime = file.type.startsWith('image/');
+
+    if (!isImageMime || !allowedExtensions.includes(fileExtension)) {
+        alert("Invalid file type! Please upload an image file (.jpg, .png, .webp, .gif, .svg).");
+        event.target.value = '';
+        return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = function (e) {
+        userAccount.avatar = e.target.result;
+        saveAccount();
+        setupAvatarSelector();
+        alert("Profile picture updated!");
+    };
+    reader.readAsDataURL(file);
+}
+
+// Reset custom image back to default emoji
+function removeCustomAvatar() {
+    userAccount.avatar = "⚔️";
+    saveAccount();
+    setupAvatarSelector();
+    const fileInput = document.getElementById('avatar-file-input');
+    if (fileInput) fileInput.value = '';
 }
 
 function setupAvatarSelector() {
@@ -206,7 +257,7 @@ function importAccountFile(event) {
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = function(e) {
+    reader.onload = function (e) {
         try {
             const json = JSON.parse(e.target.result);
             if (!json.username || json.xp === undefined || !json.stats) {
@@ -241,8 +292,8 @@ function recordGameEnd(role, won) {
 
     const xpNotice = document.getElementById('xp-gain-notice');
     if (xpNotice) {
-        xpNotice.innerText = won 
-            ? `🏆 VICTORY! +${xpGained} XP Earned! (Total XP: ${userAccount.xp})` 
+        xpNotice.innerText = won
+            ? `🏆 VICTORY! +${xpGained} XP Earned! (Total XP: ${userAccount.xp})`
             : `💀 DEFEAT! +${xpGained} XP Earned for participating. (Total XP: ${userAccount.xp})`;
         xpNotice.style.color = won ? 'var(--accent-green)' : 'var(--accent-gold)';
     }
@@ -462,7 +513,7 @@ function importPresetFile(event) {
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = function(e) {
+    reader.onload = function (e) {
         try {
             const json = JSON.parse(e.target.result);
             if (!json.name || !Array.isArray(json.items) || json.items.length < 3) {
@@ -553,7 +604,7 @@ async function createRoom() {
     sessionStorage.setItem('spyfall_active_room', roomCode);
 
     if (myPeer) {
-        try { myPeer.destroy(); } catch (e) {}
+        try { myPeer.destroy(); } catch (e) { }
         myPeer = null;
     }
 
@@ -562,12 +613,12 @@ async function createRoom() {
 
     myPeer.on('open', (id) => {
         updateStatus("Connected as Host.");
-        playerList = [{ 
-            id: myPeerId, 
+        playerList = [{
+            id: myPeerId,
             accountId: userAccount.id,
-            name: userAccount.username, 
-            avatar: userAccount.avatar, 
-            level: userAccount.level, 
+            name: userAccount.username,
+            avatar: userAccount.avatar,
+            level: userAccount.level,
             isHost: true,
             isOnline: true
         }];
@@ -608,7 +659,7 @@ function joinRoom() {
     if (joinBtn) joinBtn.disabled = true;
 
     if (myPeer) {
-        try { myPeer.destroy(); } catch (e) {}
+        try { myPeer.destroy(); } catch (e) { }
         myPeer = null;
     }
 
@@ -628,12 +679,12 @@ function joinRoom() {
             isConnecting = false;
             if (joinBtn) joinBtn.disabled = false;
             updateStatus("Connected to room " + roomCode);
-            conn.send({ 
-                type: 'JOIN', 
+            conn.send({
+                type: 'JOIN',
                 accountId: userAccount.id,
-                name: userAccount.username, 
-                avatar: userAccount.avatar, 
-                level: userAccount.level 
+                name: userAccount.username,
+                avatar: userAccount.avatar,
+                level: userAccount.level
             });
         });
 
@@ -660,6 +711,27 @@ function handleHostMessage(conn, data) {
         const accId = data.accountId || conn.peer;
         let existingPlayer = playerList.find(p => p.accountId === accId);
 
+        // Validate received avatar: Must be standard string/emoji OR valid Base64 image under 3 MB
+        let validAvatar = "⚔️";
+        if (data.avatar && typeof data.avatar === 'string') {
+            if (data.avatar.startsWith('data:image/')) {
+                // Check if it's an allowed image extension/MIME type
+                const isImageExtension = /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,/i.test(data.avatar);
+                
+                // Base64 encoding size check: 3 MB raw binary translates to ~4,194,304 Base64 characters
+                const isUnder3MB = data.avatar.length <= 4194304;
+
+                if (isImageExtension && isUnder3MB) {
+                    validAvatar = data.avatar;
+                } else {
+                    console.warn(`Rejected profile picture from peer ${conn.peer}: Invalid image format or size > 3MB.`);
+                }
+            } else {
+                // Standard emoji or short text avatar
+                validAvatar = data.avatar;
+            }
+        }
+
         if (existingPlayer) {
             if (existingPlayer.id && hostConnections[existingPlayer.id] && existingPlayer.id !== conn.peer) {
                 try { hostConnections[existingPlayer.id].close(); } catch (e) {}
@@ -667,7 +739,7 @@ function handleHostMessage(conn, data) {
             }
             existingPlayer.id = conn.peer;
             existingPlayer.name = data.name;
-            existingPlayer.avatar = data.avatar;
+            existingPlayer.avatar = validAvatar;
             existingPlayer.level = data.level;
             existingPlayer.isOnline = true;
             hostConnections[conn.peer] = conn;
@@ -705,7 +777,7 @@ function handleHostMessage(conn, data) {
                 id: conn.peer, 
                 accountId: accId,
                 name: data.name, 
-                avatar: data.avatar || "⚔️", 
+                avatar: validAvatar, 
                 level: data.level || 1, 
                 isHost: false,
                 isOnline: true
@@ -727,7 +799,7 @@ function kickPlayer(accountId) {
             try {
                 conn.send({ type: 'KICKED' });
                 setTimeout(() => { conn.close(); }, 100);
-            } catch (e) {}
+            } catch (e) { }
             delete hostConnections[player.id];
         }
         playerList = playerList.filter(p => p.accountId !== accountId);
@@ -756,17 +828,17 @@ function renderLobbyList() {
         const div = document.createElement('div');
         div.className = `player-item ${!p.isOnline ? 'offline' : ''}`;
 
-        const kickBtnHtml = (isHost && !p.isHost) 
-            ? `<button class="sm-btn" style="background:var(--accent-red); color:#fff; margin-left:8px;" onclick="kickPlayer('${p.accountId}')">Remove</button>` 
+        const kickBtnHtml = (isHost && !p.isHost)
+            ? `<button class="sm-btn" style="background:var(--accent-red); color:#fff; margin-left:8px;" onclick="kickPlayer('${p.accountId}')">Remove</button>`
             : '';
 
-        const statusPill = p.isOnline 
-            ? '<span class="status-pill online">ONLINE</span>' 
+        const statusPill = p.isOnline
+            ? '<span class="status-pill online">ONLINE</span>'
             : '<span class="status-pill offline">DISCONNECTED</span>';
 
         div.innerHTML = `
             <div class="player-item-left">
-                <span>${p.avatar || '⚔️'}</span>
+                <span class="account-avatar" style="width:28px; height:28px; border:none;">${renderAvatarHTML(p.avatar)}</span>
                 <strong>${p.name}</strong>
                 <span class="account-level-badge">Lvl ${p.level || 1}</span>
                 ${statusPill}
@@ -932,13 +1004,13 @@ function setupVotingScreen(data) {
         div.className = `vote-card ${!p.isOnline ? 'offline' : ''}`;
         div.id = 'vote-card-' + p.accountId;
 
-        const statusPill = p.isOnline 
-            ? '<span class="status-pill online">ONLINE</span>' 
+        const statusPill = p.isOnline
+            ? '<span class="status-pill online">ONLINE</span>'
             : '<span class="status-pill offline">OFFLINE</span>';
 
         div.innerHTML = `
             <div style="display:flex; align-items:center; gap:10px;">
-                <span style="font-size:1.4rem;">${p.avatar || '⚔️'}</span>
+                <span style="width:32px; height:32px; display:inline-block;">${renderAvatarHTML(p.avatar)}</span>
                 <strong>${p.name} ${p.accountId === userAccount.id ? ' (You)' : ''}</strong>
                 ${statusPill}
             </div>
@@ -1197,13 +1269,13 @@ function renderRosterStatus() {
     playerList.forEach(p => {
         const div = document.createElement('div');
         div.className = `player-item ${!p.isOnline ? 'offline' : ''}`;
-        const statusPill = p.isOnline 
-            ? '<span class="status-pill online">ONLINE</span>' 
+        const statusPill = p.isOnline
+            ? '<span class="status-pill online">ONLINE</span>'
             : '<span class="status-pill offline">RECONNECTING...</span>';
 
         div.innerHTML = `
             <div class="player-item-left">
-                <span>${p.avatar || '⚔️'}</span>
+                <span style="width:24px; height:24px; display:inline-block;">${renderAvatarHTML(p.avatar)}</span>
                 <strong>${p.name}</strong>
             </div>
             <div>${statusPill}</div>
