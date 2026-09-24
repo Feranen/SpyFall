@@ -378,7 +378,8 @@ textarea:focus {
     animation: pulse 1.5s infinite;
 }
 
-.role-value.impostor {
+.role-value.impostor,
+.role-value.jester {
     color: var(--accent-purple);
     font-size: 1.8rem;
     animation: pulse 1.5s infinite;
@@ -397,7 +398,8 @@ textarea:focus {
     width: 100%;
 }
 
-.impostor-rules {
+.impostor-rules,
+.jester-rules {
     background: rgba(171, 71, 188, 0.15);
     border-left: 3px solid var(--accent-purple);
     color: #f3e5f5;

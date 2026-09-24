@@ -72,9 +72,9 @@
                 <label class="checkbox-group">
                     <input type="checkbox" id="enable-impostor" checked>
                     <div>
-                        <strong style="color: var(--accent-purple);">Enable Impostor Role</strong>
-                        <div style="font-size: 0.75rem; color: var(--text-dim);">Knows target, wins by getting an
-                            innocent voted out!</div>
+                        <strong style="color: var(--accent-purple);">Enable Jester / Fool Role</strong>
+                        <div style="font-size: 0.75rem; color: var(--text-dim);">Knows the target, but wins only if
+                            the group votes THEM out!</div>
                     </div>
                 </label>
 
@@ -129,6 +129,10 @@
             </div>
 
             <div class="timer" id="timer-display">06:00</div>
+
+            <button class="btn btn-purple" id="spy-guess-btn" style="display:none;" onclick="openSpyGuessModal()">
+                🎯 Guess Secret Target
+            </button>
 
             <div id="host-game-controls" style="display: none; gap: 8px; margin-top: 5px;">
                 <button class="btn btn-secondary" onclick="hostToggleTimer()" id="pause-btn">Pause</button>
@@ -244,7 +248,7 @@
                 </div>
                 <div class="stat-card">
                     <div class="stat-value" id="stat-imp-wins">0</div>
-                    <div class="stat-label">Impostor Wins</div>
+                    <div class="stat-label">Jester Wins</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-value" id="stat-innocent-wins">0</div>
@@ -259,8 +263,21 @@
             <input type="file" id="account-file-input" accept=".json" style="display: none;"
                 onchange="importAccountFile(event)">
 
+            <div style="margin-top: 15px; border-top: 1px solid var(--border-color); padding-top: 12px;">
+                <label>Full Backup (Profile + All Saved Presets)</label>
+                <div class="btn-row" style="margin-top: 6px;">
+                    <button class="btn btn-blue" onclick="exportFullBackup()">📦 Export Full Backup</button>
+                    <button class="btn btn-purple" onclick="triggerImportFullBackup()">📦 Restore Full Backup</button>
+                </div>
+                <input type="file" id="full-backup-file-input" accept=".json" style="display: none;"
+                    onchange="importFullBackupFile(event)">
+            </div>
+
             <button class="btn btn-secondary" style="margin-top: 10px;"
                 onclick="closeModal('account-modal')">Close</button>
+
+            <button class="btn" style="margin-top: 10px; background: var(--accent-red);"
+                onclick="deleteAllLocalData()">🗑️ Delete All Local Data</button>
         </div>
     </div>
 
@@ -286,6 +303,20 @@
                 <button class="btn btn-green" onclick="confirmAvatarCrop()">✅ Use This Photo</button>
                 <button class="btn btn-secondary" onclick="cancelAvatarCrop()">Cancel</button>
             </div>
+        </div>
+    </div>
+
+    <!-- SPY GUESS MODAL -->
+    <div class="modal" id="spy-guess-modal">
+        <div class="modal-content">
+            <div class="modal-title">🎯 Guess the Secret Target</div>
+            <div class="modal-text">
+                Pick the hero/location you think everyone else was given. Guess right and the Spies win instantly -
+                guess wrong and the round ends in an Innocent win. Choose carefully!
+            </div>
+            <div class="hero-grid" id="spy-guess-list" style="max-height: 260px;"></div>
+            <button class="btn btn-secondary" style="margin-top: 10px;"
+                onclick="closeModal('spy-guess-modal')">Cancel</button>
         </div>
     </div>
 

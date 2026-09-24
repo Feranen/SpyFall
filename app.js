@@ -1,5 +1,24 @@
 const AVATAR_OPTIONS = ["⚔️", "🛡️", "🔮", "🏹", "🗡️", "👑", "👺", "🐉", "⚡", "❄️", "🔥", "🎯"];
 
+// --- SECURITY / ANTI-CHEAT HELPERS ---
+// Escape untrusted strings (player names, imported preset facts, etc.) before
+// they're ever inserted via innerHTML. Player names & preset text can arrive
+// over the PeerJS mesh from other peers (or a malicious host), so any of it
+// must be treated as data, never markup.
+function escapeHtml(str) {
+    if (typeof str !== 'string') return '';
+    return str.replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+// Clamp/validate a display name coming from the network (or local input).
+function sanitizeName(name, fallback) {
+    if (typeof name !== 'string') return fallback || 'Player';
+    const trimmed = name.trim().slice(0, 20);
+    return trimmed.length > 0 ? trimmed : (fallback || 'Player');
+}
+
 // --- PRESET SCANNER & LOCAL STORAGE MANAGEMENT ---
 
 // Retrieve all presets currently saved in localStorage
@@ -127,10 +146,29 @@ function saveAccount() {
     renderAccountUI();
 }
 
+// Progression curve: each level requires more XP than the last, instead of a
+// flat 200 XP/level. Level N -> N+1 costs 150 + (N-1)*50 XP (150, 200, 250...).
+function xpRequiredForLevel(level) {
+    return 150 + (level - 1) * 50;
+}
+
+function computeLevelProgress(totalXp) {
+    let level = 1;
+    let remaining = Math.max(0, totalXp || 0);
+    let needed = xpRequiredForLevel(level);
+    while (remaining >= needed) {
+        remaining -= needed;
+        level++;
+        needed = xpRequiredForLevel(level);
+    }
+    return { level, currentLevelXp: remaining, xpNeeded: needed };
+}
+
 function renderAccountUI() {
-    userAccount.level = Math.floor(userAccount.xp / 200) + 1;
-    const currentLvlXp = userAccount.xp % 200;
-    const fillPercent = Math.min(100, (currentLvlXp / 200) * 100);
+    const progress = computeLevelProgress(userAccount.xp);
+    userAccount.level = progress.level;
+    const currentLvlXp = progress.currentLevelXp;
+    const fillPercent = Math.min(100, (currentLvlXp / progress.xpNeeded) * 100);
 
     const barAvatar = document.getElementById('bar-avatar');
     if (barAvatar) barAvatar.innerHTML = renderAvatarHTML(userAccount.avatar);
@@ -145,7 +183,7 @@ function renderAccountUI() {
     if (modalLvl) modalLvl.innerText = `Level ${userAccount.level}`;
 
     const modalXp = document.getElementById('account-modal-xp');
-    if (modalXp) modalXp.innerText = `${currentLvlXp} / 200 XP`;
+    if (modalXp) modalXp.innerText = `${currentLvlXp} / ${progress.xpNeeded} XP`;
 
     const xpFill = document.getElementById('account-xp-fill');
     if (xpFill) xpFill.style.width = `${fillPercent}%`;
@@ -407,6 +445,72 @@ function exportAccountFile() {
     downloadJsonFile(`${userAccount.username}_profile.json`, userAccount);
 }
 
+// --- FULL ACCOUNT BACKUP (account + all local presets in one file) ---
+function exportFullBackup() {
+    downloadJsonFile(`${userAccount.username}_full_backup.json`, {
+        type: 'spyfall_full_backup',
+        version: 1,
+        account: userAccount,
+        presets: getStoredPresets()
+    });
+}
+
+function triggerImportFullBackup() {
+    const input = document.getElementById('full-backup-file-input');
+    if (input) input.click();
+}
+
+function importFullBackupFile(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function (e) {
+        try {
+            const json = JSON.parse(e.target.result);
+            if (!json || typeof json !== 'object' || !json.account || !json.account.username || json.account.xp === undefined || !json.account.stats) {
+                throw new Error("Invalid full backup file format!");
+            }
+            userAccount = json.account;
+            saveAccount();
+            const nameInput = document.getElementById('player-name');
+            if (nameInput) nameInput.value = userAccount.username;
+
+            if (json.presets && typeof json.presets === 'object') {
+                savePresetsToStorage(json.presets);
+            }
+
+            alert(`Full backup restored! Welcome back, ${userAccount.username}.`);
+        } catch (err) {
+            alert("Failed to restore backup: " + err.message);
+        }
+        event.target.value = '';
+    };
+    reader.readAsText(file);
+}
+
+// --- DELETE ALL LOCAL DATA ---
+function deleteAllLocalData() {
+    const confirmed = confirm(
+        "This will permanently delete your account profile, XP/stats, avatar, and all saved presets from this browser. This cannot be undone. Continue?"
+    );
+    if (!confirmed) return;
+
+    const doubleConfirm = confirm("Are you absolutely sure? This is your final confirmation.");
+    if (!doubleConfirm) return;
+
+    try {
+        localStorage.removeItem('spyfall_user_account');
+        localStorage.removeItem('spyfall_presets');
+        sessionStorage.removeItem('spyfall_active_room');
+        sessionStorage.removeItem('spyfall_active_role');
+    } catch (e) {
+        console.error("Failed clearing storage:", e);
+    }
+
+    location.reload();
+}
+
 function triggerImportAccount() {
     const input = document.getElementById('account-file-input');
     if (input) input.click();
@@ -443,7 +547,7 @@ function recordGameEnd(role, won) {
     if (won) {
         xpGained += 100;
         if (role === "SPY") userAccount.stats.spyWins = (userAccount.stats.spyWins || 0) + 1;
-        else if (role === "IMPOSTOR") userAccount.stats.impWins = (userAccount.stats.impWins || 0) + 1;
+        else if (role === "JESTER") userAccount.stats.impWins = (userAccount.stats.impWins || 0) + 1;
         else userAccount.stats.innocentWins = (userAccount.stats.innocentWins || 0) + 1;
     }
 
@@ -501,6 +605,66 @@ let playerList = [];
 let hostPeerCheckInterval = null;
 let lastGameOverPayload = null;
 let currentStarterName = "Player";
+
+// --- HEARTBEAT (PeerJS reconnection fallback) ---
+// WebRTC DataChannels can drop silently without ever firing PeerJS's own
+// 'close'/'error' events. A lightweight ping/pong catches that early instead
+// of waiting on the browser's default socket-close detection.
+const HEARTBEAT_INTERVAL_MS = 4000;
+const HEARTBEAT_TIMEOUT_MS = 13000; // ~3 missed beats before we call it dead
+let heartbeatInterval = null;
+let connLastPong = {};      // host-side: peerId -> last time we heard from that peer
+let lastHostContactAt = 0;  // client-side: last time we heard anything from the host
+
+function startHeartbeat() {
+    stopHeartbeat();
+    lastHostContactAt = Date.now();
+    heartbeatInterval = setInterval(() => {
+        if (isHost) {
+            const now = Date.now();
+            Object.keys(hostConnections).forEach(peerId => {
+                if (!connLastPong[peerId]) connLastPong[peerId] = now;
+                safeSend(hostConnections[peerId], { type: 'PING', t: now });
+                if (now - connLastPong[peerId] > HEARTBEAT_TIMEOUT_MS) {
+                    handleHostConnectionDrop(peerId);
+                }
+            });
+        } else if (myConnection) {
+            safeSend(myConnection, { type: 'PING', t: Date.now() });
+            if (Date.now() - lastHostContactAt > HEARTBEAT_TIMEOUT_MS) {
+                console.warn("Heartbeat timeout - host appears unreachable.");
+                try { myConnection.close(); } catch (e) { }
+            }
+        }
+    }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+    connLastPong = {};
+}
+
+// Host-side: a peer's heartbeat has gone silent for too long - treat exactly
+// like a normal PeerJS 'close' event so the rest of the app (lobby/roster
+// updates) reacts the same way regardless of how the drop was detected.
+function handleHostConnectionDrop(peerId) {
+    const conn = hostConnections[peerId];
+    delete hostConnections[peerId];
+    delete connLastPong[peerId];
+    if (conn) {
+        try { conn.close(); } catch (e) { }
+    }
+    const p = playerList.find(pl => pl.id === peerId);
+    if (p && p.isOnline) {
+        p.isOnline = false;
+        if (gamePhase === 'LOBBY') broadcastLobbyState();
+        else broadcastPlayerStatusUpdate();
+    }
+}
+
+// --- SPY GUESS STATE ---
+let spyGuessResolved = false; // guards against multiple guesses ending the round twice
 
 // Send helper: never let a single dead/throwing connection break a broadcast loop.
 function safeSend(conn, payload) {
@@ -808,6 +972,7 @@ function initHostPeer(code, isResume) {
     sessionStorage.setItem('spyfall_active_room', roomCode);
     sessionStorage.setItem('spyfall_active_role', 'host');
 
+    stopHeartbeat();
     if (myPeer) {
         try { myPeer.destroy(); } catch (e) { }
         myPeer = null;
@@ -831,6 +996,7 @@ function initHostPeer(code, isResume) {
         }];
         setupLobbyUI();
         startHostActiveCheck();
+        startHeartbeat();
     });
 
     myPeer.on('connection', (conn) => {
@@ -886,6 +1052,7 @@ function joinRoom() {
     const joinBtn = document.getElementById('join-btn');
     if (joinBtn) joinBtn.disabled = true;
 
+    stopHeartbeat();
     if (myPeer) {
         try { myPeer.destroy(); } catch (e) { }
         myPeer = null;
@@ -910,6 +1077,7 @@ function joinRoom() {
             myConnection = conn;
             if (joinBtn) joinBtn.disabled = false;
             updateStatus("Connected to room " + roomCode);
+            startHeartbeat();
             safeSend(conn, {
                 type: 'JOIN',
                 accountId: userAccount.id,
@@ -925,6 +1093,7 @@ function joinRoom() {
             isConnecting = false;
             if (myConnection === conn) myConnection = null;
             if (joinBtn) joinBtn.disabled = false;
+            stopHeartbeat();
             alert("Disconnected from host room.");
             updateStatus("Disconnected.");
         });
@@ -943,8 +1112,19 @@ function joinRoom() {
 }
 
 function handleHostMessage(conn, data) {
+    // Any message at all proves the channel is alive - refresh heartbeat state.
+    connLastPong[conn.peer] = Date.now();
+
+    if (data.type === 'PONG') {
+        return;
+    } else if (data.type === 'PING') {
+        safeSend(conn, { type: 'PONG', t: Date.now() });
+        return;
+    }
+
     if (data.type === 'JOIN') {
-        const accId = data.accountId || conn.peer;
+        const accId = typeof data.accountId === 'string' ? data.accountId.slice(0, 64) : conn.peer;
+        const safeIncomingName = sanitizeName(data.name, "Player");
         let existingPlayer = playerList.find(p => p.accountId === accId);
 
         // Validate received avatar: Must be standard string/emoji OR valid Base64 image under 3 MB
@@ -978,9 +1158,9 @@ function handleHostMessage(conn, data) {
                 delete hostConnections[existingPlayer.id];
             }
             existingPlayer.id = conn.peer;
-            existingPlayer.name = data.name;
+            existingPlayer.name = safeIncomingName;
             existingPlayer.avatar = validAvatar;
-            existingPlayer.level = data.level;
+            existingPlayer.level = Number.isFinite(data.level) ? data.level : 1;
             existingPlayer.isOnline = true;
             hostConnections[conn.peer] = conn;
 
@@ -1018,17 +1198,34 @@ function handleHostMessage(conn, data) {
             playerList.push({ 
                 id: conn.peer, 
                 accountId: accId,
-                name: data.name, 
+                name: safeIncomingName, 
                 avatar: validAvatar, 
-                level: data.level || 1, 
+                level: Number.isFinite(data.level) ? data.level : 1, 
                 isHost: false,
                 isOnline: true
             });
             broadcastLobbyState();
         }
     } else if (data.type === 'SUBMIT_VOTE') {
+        // Anti-cheat: only accept votes from known players in the voting phase,
+        // for a target that's actually in the room (reject spoofed IDs).
+        if (gamePhase !== 'VOTING') return;
+        const voter = playerList.find(p => p.accountId === data.voterAccountId && p.id === conn.peer);
+        const targetValid = playerList.some(p => p.accountId === data.targetAccountId);
+        if (!voter || !targetValid) {
+            console.warn("Rejected invalid/spoofed vote from peer", conn.peer);
+            return;
+        }
         votes[data.voterAccountId] = data.targetAccountId;
         broadcastVoteProgress();
+    } else if (data.type === 'SPY_GUESS') {
+        if (gamePhase !== 'GAME' || spyGuessResolved) return;
+        const guesser = playerList.find(p => p.accountId === data.accountId && p.id === conn.peer);
+        if (!guesser || gameRoles[data.accountId] !== "SPY") {
+            console.warn("Rejected spy guess from non-spy or spoofed peer", conn.peer);
+            return;
+        }
+        hostResolveSpyGuess(data.accountId, typeof data.guess === 'string' ? data.guess : '');
     }
 }
 
@@ -1068,8 +1265,9 @@ function renderLobbyList() {
         const div = document.createElement('div');
         div.className = `player-item ${!p.isOnline ? 'offline' : ''}`;
 
+        const safeAccId = escapeHtml(String(p.accountId)).replace(/'/g, "&#39;");
         const kickBtnHtml = (isHost && !p.isHost)
-            ? `<button class="sm-btn" style="background:var(--accent-red); color:#fff; margin-left:8px;" onclick="kickPlayer('${p.accountId}')">Remove</button>`
+            ? `<button class="sm-btn" style="background:var(--accent-red); color:#fff; margin-left:8px;" onclick="kickPlayer('${safeAccId}')">Remove</button>`
             : '';
 
         const statusPill = p.isOnline
@@ -1079,8 +1277,8 @@ function renderLobbyList() {
         div.innerHTML = `
             <div class="player-item-left">
                 <span class="account-avatar" style="width:28px; height:28px; border:none;">${renderAvatarHTML(p.avatar)}</span>
-                <strong>${p.name}</strong>
-                <span class="account-level-badge">Lvl ${p.level || 1}</span>
+                <strong>${escapeHtml(p.name)}</strong>
+                <span class="account-level-badge">Lvl ${Number.isFinite(p.level) ? p.level : 1}</span>
                 ${statusPill}
             </div>
             <div>
@@ -1110,11 +1308,11 @@ function setupLobbyUI() {
 
 // --- HOST GAME START LOGIC ---
 function hostStartGame() {
-    const spyCount = parseInt(document.getElementById('spy-count').value) || 1;
-    const enableImpostor = document.getElementById('enable-impostor').checked;
-    const timeMins = parseInt(document.getElementById('round-time').value) || 6;
+    const spyCount = Math.min(3, Math.max(1, parseInt(document.getElementById('spy-count').value) || 1));
+    const enableJester = document.getElementById('enable-impostor').checked;
+    const timeMins = Math.min(15, Math.max(1, parseInt(document.getElementById('round-time').value) || 6));
 
-    let requiredSpecialRoles = spyCount + (enableImpostor ? 1 : 0);
+    let requiredSpecialRoles = spyCount + (enableJester ? 1 : 0);
     if (requiredSpecialRoles >= playerList.length) {
         alert("Spies + Impostor must be fewer than total players in the room!");
         return;
@@ -1149,20 +1347,21 @@ function hostStartGame() {
         }
     }
 
-    if (enableImpostor) {
-        let assignedImp = false;
-        while (!assignedImp) {
+    if (enableJester) {
+        let assignedJester = false;
+        while (!assignedJester) {
             let rIdx = Math.floor(Math.random() * accIds.length);
             let targetId = accIds[rIdx];
             if (gameRoles[targetId] === chosenSecret) {
-                gameRoles[targetId] = "IMPOSTOR";
-                assignedImp = true;
+                gameRoles[targetId] = "JESTER";
+                assignedJester = true;
             }
         }
     }
 
     currentStarterName = playerList[Math.floor(Math.random() * playerList.length)].name;
     timeRemaining = timeMins * 60;
+    spyGuessResolved = false;
 
     playerList.forEach(p => {
         const role = gameRoles[p.accountId];
@@ -1253,7 +1452,7 @@ function setupVotingScreen(data) {
         div.innerHTML = `
             <div style="display:flex; align-items:center; gap:10px;">
                 <span style="width:32px; height:32px; display:inline-block;">${renderAvatarHTML(p.avatar)}</span>
-                <strong>${p.name} ${p.accountId === userAccount.id ? ' (You)' : ''}</strong>
+                <strong>${escapeHtml(p.name)} ${p.accountId === userAccount.id ? ' (You)' : ''}</strong>
                 ${statusPill}
             </div>
             <div style="font-size:0.8rem; color:var(--accent-gold);">Accuse 🎯</div>
@@ -1339,31 +1538,29 @@ function hostConcludeVoting() {
         votedOutPlayer = playerList.find(p => p.accountId === votedOutId);
         const votedRole = gameRoles[votedOutId];
 
-        if (votedRole === "SPY" || votedRole === "IMPOSTOR") {
+        // Jester's whole plan is to get voted out - so that outcome takes priority.
+        if (votedRole === "JESTER") {
+            winner = "JESTER";
+        } else if (votedRole === "SPY") {
             winner = "INNOCENTS";
         } else {
-            const hasImpostor = Object.values(gameRoles).includes("IMPOSTOR");
-            if (hasImpostor) {
-                winner = "IMPOSTOR";
-            } else {
-                winner = "SPIES";
-            }
+            winner = "SPIES";
         }
     }
 
     const spyNames = [];
-    let impostorName = null;
+    let jesterName = null;
 
     playerList.forEach(p => {
         if (gameRoles[p.accountId] === "SPY") spyNames.push(p.name);
-        if (gameRoles[p.accountId] === "IMPOSTOR") impostorName = p.name;
+        if (gameRoles[p.accountId] === "JESTER") jesterName = p.name;
     });
 
     lastGameOverPayload = {
         type: 'GAME_OVER',
         secretTarget: chosenSecret,
         spies: spyNames,
-        impostor: impostorName,
+        jester: jesterName,
         winner: winner,
         votedOutName: votedOutPlayer ? votedOutPlayer.name : (isTie ? "Nobody (Tie Vote)" : "Nobody")
     };
@@ -1382,18 +1579,18 @@ function hostEndGame() {
     gamePhase = 'REVEAL';
 
     const spyNames = [];
-    let impostorName = null;
+    let jesterName = null;
 
     playerList.forEach(p => {
         if (gameRoles[p.accountId] === "SPY") spyNames.push(p.name);
-        if (gameRoles[p.accountId] === "IMPOSTOR") impostorName = p.name;
+        if (gameRoles[p.accountId] === "JESTER") jesterName = p.name;
     });
 
     lastGameOverPayload = {
         type: 'GAME_OVER',
         secretTarget: chosenSecret,
         spies: spyNames,
-        impostor: impostorName,
+        jester: jesterName,
         winner: "SPIES",
         votedOutName: "None (Ended by Host)"
     };
@@ -1411,6 +1608,16 @@ function hostReturnToLobby() {
 
 // --- CLIENT RECEIVE LOGIC ---
 function handleClientMessage(data) {
+    // Any message at all proves the host connection is alive.
+    lastHostContactAt = Date.now();
+
+    if (data.type === 'PONG') {
+        return;
+    } else if (data.type === 'PING') {
+        safeSend(myConnection, { type: 'PONG', t: Date.now() });
+        return;
+    }
+
     if (data.type === 'KICKED') {
         alert(data.reason || "You have been removed from the room.");
         sessionStorage.removeItem('spyfall_active_room');
@@ -1471,20 +1678,25 @@ function setupClientGameScreen(data) {
         roleValElem.innerText = "SPY!";
         roleValElem.className = "role-value spy";
         factsContent.innerHTML = "You don't know the secret hero or location! Ask clever questions and listen carefully to stay hidden.";
-    } else if (data.role === "IMPOSTOR") {
+    } else if (data.role === "JESTER") {
         roleTitleElem.innerText = "YOU ARE THE";
-        roleValElem.innerText = "IMPOSTOR!";
-        roleValElem.className = "role-value impostor";
-        factsBox.className = "facts-box impostor-rules";
-        factsContent.innerHTML = `<strong>Target:</strong> ${data.secretTarget}<br>
-        <strong>Facts:</strong> ${getFacts(data.secretTarget)}<br><br>
-        ⚠️ <strong>OBJECTIVE:</strong> You know the hero! Trick the innocents into voting out someone who is NOT a Spy. If an innocent hero gets kicked, YOU WIN!`;
+        roleValElem.innerText = "JESTER!";
+        roleValElem.className = "role-value jester";
+        factsBox.className = "facts-box jester-rules";
+        factsContent.innerHTML = `<strong>Target:</strong> ${escapeHtml(data.secretTarget)}<br>
+        <strong>Facts:</strong> ${escapeHtml(getFacts(data.secretTarget))}<br><br>
+        🃏 <strong>OBJECTIVE:</strong> You know the hero! You don't want to blend in - you want to get voted out. Act suspicious and bait the group into voting for YOU. If they vote you out, YOU WIN!`;
     } else {
         roleTitleElem.innerText = "SECRET TARGET:";
         roleValElem.innerText = data.role;
         roleValElem.className = "role-value";
-        factsContent.innerHTML = `<strong>Traits/Facts:</strong> ${getFacts(data.role)}`;
+        factsContent.innerHTML = `<strong>Traits/Facts:</strong> ${escapeHtml(getFacts(data.role))}`;
     }
+
+    // Spy-only: guess the secret target to end the round immediately.
+    const spyGuessBtn = document.getElementById('spy-guess-btn');
+    if (spyGuessBtn) spyGuessBtn.style.display = (data.role === "SPY") ? 'block' : 'none';
+    spyGuessResolved = false;
 
     renderRosterStatus();
 
@@ -1519,11 +1731,77 @@ function renderRosterStatus() {
         div.innerHTML = `
             <div class="player-item-left">
                 <span style="width:24px; height:24px; display:inline-block;">${renderAvatarHTML(p.avatar)}</span>
-                <strong>${p.name}</strong>
+                <strong>${escapeHtml(p.name)}</strong>
             </div>
             <div>${statusPill}</div>
         `;
         container.appendChild(div);
+    });
+}
+
+// --- SPY GUESS-THE-TARGET ---
+function openSpyGuessModal() {
+    if (myAssignedRole !== "SPY" || spyGuessResolved) return;
+    const listElem = document.getElementById('spy-guess-list');
+    if (!listElem) return;
+    listElem.innerHTML = '';
+
+    currentDeck.slice().sort().forEach(item => {
+        const div = document.createElement('div');
+        div.className = 'hero-item';
+        div.style.cursor = 'pointer';
+        div.innerText = item;
+        div.onclick = () => confirmSpyGuess(item);
+        listElem.appendChild(div);
+    });
+
+    openModal('spy-guess-modal');
+}
+
+function confirmSpyGuess(guess) {
+    if (!confirm(`Lock in "${guess}" as your final guess? This ends the round immediately, win or lose.`)) return;
+    if (spyGuessResolved) return;
+
+    closeModal('spy-guess-modal');
+
+    if (isHost) {
+        hostResolveSpyGuess(userAccount.id, guess);
+    } else if (!safeSend(myConnection, { type: 'SPY_GUESS', accountId: userAccount.id, guess: guess })) {
+        alert("Couldn't send your guess - check your connection and try again.");
+    }
+}
+
+function hostResolveSpyGuess(guesserAccountId, guess) {
+    if (gamePhase !== 'GAME' || spyGuessResolved) return;
+    spyGuessResolved = true;
+    if (timerInterval) clearInterval(timerInterval);
+    gamePhase = 'REVEAL';
+
+    const correct = typeof guess === 'string' && guess.trim().toLowerCase() === String(chosenSecret).trim().toLowerCase();
+    const guesser = playerList.find(p => p.accountId === guesserAccountId);
+
+    const spyNames = [];
+    let jesterName = null;
+    playerList.forEach(p => {
+        if (gameRoles[p.accountId] === "SPY") spyNames.push(p.name);
+        if (gameRoles[p.accountId] === "JESTER") jesterName = p.name;
+    });
+
+    lastGameOverPayload = {
+        type: 'GAME_OVER',
+        secretTarget: chosenSecret,
+        spies: spyNames,
+        jester: jesterName,
+        winner: correct ? "SPIES" : "INNOCENTS",
+        votedOutName: `None - ${guesser ? guesser.name : 'The Spy'} guessed "${guess}" (${correct ? 'Correct!' : 'Wrong!'})`
+    };
+
+    playerList.forEach(p => {
+        if (p.isHost) {
+            setupRevealScreen(lastGameOverPayload);
+        } else {
+            safeSend(hostConnections[p.id], lastGameOverPayload);
+        }
     });
 }
 
@@ -1553,8 +1831,8 @@ function setupRevealScreen(data) {
         } else if (data.winner === "SPIES") {
             winnerElem.innerText = "🕵️ SPIES WIN!";
             winnerElem.style.color = "var(--accent-red)";
-        } else if (data.winner === "IMPOSTOR") {
-            winnerElem.innerText = "🎭 IMPOSTOR WINS!";
+        } else if (data.winner === "JESTER") {
+            winnerElem.innerText = "🃏 JESTER WINS!";
             winnerElem.style.color = "var(--accent-purple)";
         }
     }
@@ -1571,10 +1849,10 @@ function setupRevealScreen(data) {
     const impTitle = document.getElementById('reveal-impostor-title');
     const impVal = document.getElementById('reveal-impostor');
     if (impTitle && impVal) {
-        if (data.impostor) {
+        if (data.jester) {
             impTitle.style.display = 'block';
             impVal.style.display = 'block';
-            impVal.innerText = data.impostor;
+            impVal.innerText = data.jester;
         } else {
             impTitle.style.display = 'none';
             impVal.style.display = 'none';
@@ -1588,11 +1866,11 @@ function setupRevealScreen(data) {
     if (clientReturnMsg) clientReturnMsg.style.display = isHost ? 'none' : 'block';
 
     let didWin = false;
-    if (data.winner === "INNOCENTS" && myAssignedRole !== "SPY" && myAssignedRole !== "IMPOSTOR") {
+    if (data.winner === "INNOCENTS" && myAssignedRole !== "SPY" && myAssignedRole !== "JESTER") {
         didWin = true;
     } else if (data.winner === "SPIES" && myAssignedRole === "SPY") {
         didWin = true;
-    } else if (data.winner === "IMPOSTOR" && myAssignedRole === "IMPOSTOR") {
+    } else if (data.winner === "JESTER" && myAssignedRole === "JESTER") {
         didWin = true;
     }
 
