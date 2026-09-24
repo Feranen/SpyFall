@@ -178,15 +178,19 @@ function renderAvatarHTML(avatarData) {
     return avatarData || '⚔️';
 }
 
-// Handle avatar image file uploading with extension and size checks
+// Handle avatar image file uploading with extension and size checks.
+// The chosen file is only staged into the cropper - nothing is saved as the
+// account avatar until the user positions/zooms and confirms the crop, at
+// which point it's downscaled to a small fixed resolution.
 function handleAvatarUpload(event) {
     const file = event.target.files[0];
     if (!file) return;
 
-    // 1. Check File Size (< 3 MB)
-    const MAX_SIZE_BYTES = 3 * 1024 * 1024; // 3 MB
+    // 1. Check File Size on the ORIGINAL upload (it gets downscaled before storage,
+    // this just protects against the browser choking on a huge source image).
+    const MAX_SIZE_BYTES = 8 * 1024 * 1024; // 8 MB
     if (file.size > MAX_SIZE_BYTES) {
-        alert("File size exceeds 3 MB limit! Please choose a smaller image.");
+        alert("File size exceeds 8 MB limit! Please choose a smaller image.");
         event.target.value = '';
         return;
     }
@@ -204,12 +208,168 @@ function handleAvatarUpload(event) {
 
     const reader = new FileReader();
     reader.onload = function (e) {
-        userAccount.avatar = e.target.result;
-        saveAccount();
-        setupAvatarSelector();
-        alert("Profile picture updated!");
+        const img = new Image();
+        img.onload = function () {
+            openCropModal(img);
+        };
+        img.onerror = function () {
+            alert("Could not load that image. Please try a different file.");
+        };
+        img.src = e.target.result;
+    };
+    reader.onerror = function () {
+        alert("Could not read that file.");
     };
     reader.readAsDataURL(file);
+    event.target.value = '';
+}
+
+// --- AVATAR CROPPER (pan + zoom, then downscale to a small fixed size) ---
+const cropState = {
+    img: null,
+    scale: 1,
+    minScale: 1,
+    maxScale: 4,
+    offsetX: 0,
+    offsetY: 0,
+    dragging: false,
+    lastX: 0,
+    lastY: 0,
+    stageSize: 280,   // on-screen crop canvas size (px)
+    outputSize: 220   // final stored/synced avatar resolution (px) - kept small on purpose
+};
+
+function openCropModal(img) {
+    cropState.img = img;
+    const stage = cropState.stageSize;
+    cropState.minScale = stage / Math.min(img.width, img.height);
+    cropState.maxScale = cropState.minScale * 4;
+    cropState.scale = cropState.minScale;
+    cropState.offsetX = 0;
+    cropState.offsetY = 0;
+
+    const zoomSlider = document.getElementById('crop-zoom');
+    if (zoomSlider) {
+        zoomSlider.min = cropState.minScale;
+        zoomSlider.max = cropState.maxScale;
+        zoomSlider.step = (cropState.maxScale - cropState.minScale) / 100 || 0.01;
+        zoomSlider.value = cropState.minScale;
+    }
+
+    drawCropCanvas();
+    openModal('crop-modal');
+}
+
+function clampCropOffsets() {
+    if (!cropState.img) return;
+    const stage = cropState.stageSize;
+    const w = cropState.img.width * cropState.scale;
+    const h = cropState.img.height * cropState.scale;
+    const maxOffsetX = Math.max(0, (w - stage) / 2);
+    const maxOffsetY = Math.max(0, (h - stage) / 2);
+    cropState.offsetX = Math.min(maxOffsetX, Math.max(-maxOffsetX, cropState.offsetX));
+    cropState.offsetY = Math.min(maxOffsetY, Math.max(-maxOffsetY, cropState.offsetY));
+}
+
+function drawCropCanvas() {
+    const canvas = document.getElementById('crop-canvas');
+    if (!canvas || !cropState.img) return;
+    const ctx = canvas.getContext('2d');
+    const stage = cropState.stageSize;
+
+    clampCropOffsets();
+
+    ctx.clearRect(0, 0, stage, stage);
+    ctx.save();
+    ctx.translate(stage / 2 - cropState.offsetX, stage / 2 - cropState.offsetY);
+    const w = cropState.img.width * cropState.scale;
+    const h = cropState.img.height * cropState.scale;
+    ctx.drawImage(cropState.img, -w / 2, -h / 2, w, h);
+    ctx.restore();
+}
+
+function cropZoomChanged(value) {
+    cropState.scale = parseFloat(value);
+    drawCropCanvas();
+}
+
+function cropPointerDown(clientX, clientY) {
+    if (!cropState.img) return;
+    cropState.dragging = true;
+    cropState.lastX = clientX;
+    cropState.lastY = clientY;
+}
+
+function cropPointerMove(clientX, clientY) {
+    if (!cropState.dragging) return;
+    cropState.offsetX -= (clientX - cropState.lastX);
+    cropState.offsetY -= (clientY - cropState.lastY);
+    cropState.lastX = clientX;
+    cropState.lastY = clientY;
+    drawCropCanvas();
+}
+
+function cropPointerUp() {
+    cropState.dragging = false;
+}
+
+function setupCropCanvasEvents() {
+    const canvas = document.getElementById('crop-canvas');
+    if (!canvas) return;
+
+    canvas.addEventListener('mousedown', (e) => cropPointerDown(e.clientX, e.clientY));
+    window.addEventListener('mousemove', (e) => cropPointerMove(e.clientX, e.clientY));
+    window.addEventListener('mouseup', cropPointerUp);
+
+    canvas.addEventListener('touchstart', (e) => {
+        const t = e.touches[0];
+        if (t) cropPointerDown(t.clientX, t.clientY);
+        e.preventDefault();
+    }, { passive: false });
+    canvas.addEventListener('touchmove', (e) => {
+        const t = e.touches[0];
+        if (t) cropPointerMove(t.clientX, t.clientY);
+        e.preventDefault();
+    }, { passive: false });
+    canvas.addEventListener('touchend', cropPointerUp);
+    canvas.addEventListener('touchcancel', cropPointerUp);
+}
+
+function confirmAvatarCrop() {
+    const cropCanvas = document.getElementById('crop-canvas');
+    if (!cropCanvas || !cropState.img) return;
+
+    // Downscale the already-cropped view into a small fixed-size output canvas.
+    // This keeps synced avatars tiny (a few KB) instead of multi-MB uploads
+    // clogging the PeerJS data channel to every connected player.
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = cropState.outputSize;
+    outCanvas.height = cropState.outputSize;
+    const outCtx = outCanvas.getContext('2d');
+    outCtx.imageSmoothingEnabled = true;
+    outCtx.imageSmoothingQuality = 'high';
+    outCtx.drawImage(cropCanvas, 0, 0, cropState.stageSize, cropState.stageSize, 0, 0, cropState.outputSize, cropState.outputSize);
+
+    let dataUrl;
+    try {
+        dataUrl = outCanvas.toDataURL('image/jpeg', 0.85);
+    } catch (e) {
+        alert("Could not process that image (it may be blocked from being read by the browser). Try a different file.");
+        return;
+    }
+
+    userAccount.avatar = dataUrl;
+    saveAccount();
+    setupAvatarSelector();
+    closeModal('crop-modal');
+    cropState.img = null;
+}
+
+function cancelAvatarCrop() {
+    closeModal('crop-modal');
+    cropState.img = null;
+    const fileInput = document.getElementById('avatar-file-input');
+    if (fileInput) fileInput.value = '';
 }
 
 // Reset custom image back to default emoji
@@ -301,17 +461,25 @@ function recordGameEnd(role, won) {
 
 function checkActiveSession() {
     const lastRoom = sessionStorage.getItem('spyfall_active_room');
+    const lastRole = sessionStorage.getItem('spyfall_active_role');
     if (lastRoom) {
         const reconnectCode = document.getElementById('reconnect-code');
         const reconnectBox = document.getElementById('reconnect-box');
+        const reconnectLabel = document.getElementById('reconnect-label');
         if (reconnectCode) reconnectCode.innerText = lastRoom;
         if (reconnectBox) reconnectBox.style.display = 'block';
+        if (reconnectLabel) reconnectLabel.innerText = lastRole === 'host' ? 'Resume Hosting Room' : 'Reconnect to Room';
     }
 }
 
 function reconnectLastRoom() {
     const lastRoom = sessionStorage.getItem('spyfall_active_room');
-    if (lastRoom) {
+    const lastRole = sessionStorage.getItem('spyfall_active_role');
+    if (!lastRoom) return;
+
+    if (lastRole === 'host') {
+        resumeHostRoom(lastRoom);
+    } else {
         const joinInput = document.getElementById('join-code-input');
         if (joinInput) joinInput.value = lastRoom;
         joinRoom();
@@ -321,9 +489,11 @@ function reconnectLastRoom() {
 // --- MULTIPLAYER STATE ---
 let myPeer = null;
 let myPeerId = "";
+let myConnection = null; // client's outgoing connection to the host (explicit ref, not peerjs internals)
 let roomCode = "";
 let isHost = false;
 let isConnecting = false;
+let hostPeerHasOpened = false; // true once the host peer has successfully opened at least once
 let gamePhase = 'LOBBY';
 
 let hostConnections = {};
@@ -331,6 +501,24 @@ let playerList = [];
 let hostPeerCheckInterval = null;
 let lastGameOverPayload = null;
 let currentStarterName = "Player";
+
+// Send helper: never let a single dead/throwing connection break a broadcast loop.
+function safeSend(conn, payload) {
+    if (!conn || !conn.open) return false;
+    try {
+        conn.send(payload);
+        return true;
+    } catch (e) {
+        console.warn("Send failed to peer " + (conn.peer || '?') + ":", e);
+        return false;
+    }
+}
+
+function safeBroadcast(connsObj, payload) {
+    Object.keys(connsObj).forEach(peerId => {
+        safeSend(connsObj[peerId], payload);
+    });
+}
 
 let currentDeck = [];
 let activeFactsMap = {};
@@ -596,23 +784,42 @@ async function createRoom() {
     // Dynamic scan upon room creation
     await scanAndSyncPresets();
 
-    roomCode = generateRoomCode();
+    initHostPeer(generateRoomCode(), false);
+}
+
+// Re-establish a host peer on the SAME room code (used after a host refresh/reload).
+// Any players who are still connected/waiting can rejoin with the original code.
+function resumeHostRoom(code) {
+    if (isConnecting || !code) return;
+    initHostPeer(code, true);
+}
+
+// Shared host-peer bootstrap for both fresh rooms and resumed rooms.
+function initHostPeer(code, isResume) {
+    roomCode = code;
     myPeerId = "spyfall-dota-" + roomCode;
     isHost = true;
     gamePhase = 'LOBBY';
+    isConnecting = true;
+    hostPeerHasOpened = false;
+    hostConnections = {};
+    playerList = [];
 
     sessionStorage.setItem('spyfall_active_room', roomCode);
+    sessionStorage.setItem('spyfall_active_role', 'host');
 
     if (myPeer) {
         try { myPeer.destroy(); } catch (e) { }
         myPeer = null;
     }
 
-    updateStatus("Initializing host peer...");
+    updateStatus(isResume ? "Resuming host session..." : "Initializing host peer...");
     myPeer = new Peer(myPeerId);
 
     myPeer.on('open', (id) => {
-        updateStatus("Connected as Host.");
+        hostPeerHasOpened = true;
+        isConnecting = false;
+        updateStatus(isResume ? "Room resumed. Waiting for players to rejoin..." : "Connected as Host.");
         playerList = [{
             id: myPeerId,
             accountId: userAccount.id,
@@ -640,9 +847,30 @@ async function createRoom() {
         });
     });
 
+    // IMPORTANT: a transient network/signaling error must NOT nuke an already-running room
+    // (that used to disconnect every connected player just because one hiccup occurred).
+    // We only ever recreate the room automatically before it has successfully opened.
     myPeer.on('error', (err) => {
-        alert("Connection error: " + err.type + ". Trying another code...");
-        createRoom();
+        isConnecting = false;
+
+        if (!hostPeerHasOpened) {
+            if (err.type === 'unavailable-id') {
+                if (isResume) {
+                    alert("This room code isn't free to resume yet (it may still be closing on the server). Wait a few seconds and try again, or host a new game.");
+                    updateStatus("Disconnected.");
+                } else {
+                    // Fresh room creation collided with an existing code - just try another one.
+                    createRoom();
+                }
+            } else {
+                alert("Could not start the room (" + err.type + "). Please try again.");
+                updateStatus("Disconnected.");
+            }
+            return;
+        }
+
+        console.warn("Host peer error after room was active (room kept alive):", err.type, err);
+        updateStatus("Connection hiccup (" + err.type + ") - room still active.");
     });
 }
 
@@ -665,7 +893,9 @@ function joinRoom() {
 
     roomCode = codeInput;
     sessionStorage.setItem('spyfall_active_room', roomCode);
+    sessionStorage.setItem('spyfall_active_role', 'client');
     isHost = false;
+    myConnection = null;
     const hostPeerId = "spyfall-dota-" + roomCode;
 
     updateStatus("Connecting to host...");
@@ -677,9 +907,10 @@ function joinRoom() {
 
         conn.on('open', () => {
             isConnecting = false;
+            myConnection = conn;
             if (joinBtn) joinBtn.disabled = false;
             updateStatus("Connected to room " + roomCode);
-            conn.send({
+            safeSend(conn, {
                 type: 'JOIN',
                 accountId: userAccount.id,
                 name: userAccount.username,
@@ -692,9 +923,14 @@ function joinRoom() {
 
         conn.on('close', () => {
             isConnecting = false;
+            if (myConnection === conn) myConnection = null;
             if (joinBtn) joinBtn.disabled = false;
             alert("Disconnected from host room.");
             updateStatus("Disconnected.");
+        });
+
+        conn.on('error', (err) => {
+            console.warn("Client connection error:", err);
         });
     });
 
@@ -717,14 +953,18 @@ function handleHostMessage(conn, data) {
             if (data.avatar.startsWith('data:image/')) {
                 // Check if it's an allowed image extension/MIME type
                 const isImageExtension = /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,/i.test(data.avatar);
-                
-                // Base64 encoding size check: 3 MB raw binary translates to ~4,194,304 Base64 characters
-                const isUnder3MB = data.avatar.length <= 4194304;
 
-                if (isImageExtension && isUnder3MB) {
+                // Avatars are now cropped/downscaled client-side before ever being sent, so a
+                // legitimate avatar should be well under this. This keeps a hard ceiling so a
+                // modified/malicious client can't flood the mesh with huge payloads that would
+                // stall the data channel for every other peer.
+                const MAX_AVATAR_BASE64_CHARS = 400000; // ~300 KB raw
+                const isUnderSizeCap = data.avatar.length <= MAX_AVATAR_BASE64_CHARS;
+
+                if (isImageExtension && isUnderSizeCap) {
                     validAvatar = data.avatar;
                 } else {
-                    console.warn(`Rejected profile picture from peer ${conn.peer}: Invalid image format or size > 3MB.`);
+                    console.warn(`Rejected profile picture from peer ${conn.peer}: Invalid image format or size too large.`);
                 }
             } else {
                 // Standard emoji or short text avatar
@@ -747,10 +987,11 @@ function handleHostMessage(conn, data) {
             if (gamePhase === 'LOBBY') {
                 broadcastLobbyState();
             } else if (gamePhase === 'GAME') {
-                conn.send({
+                const reconnectRole = gameRoles[accId];
+                safeSend(conn, {
                     type: 'GAME_START',
-                    role: gameRoles[accId],
-                    secretTarget: chosenSecret,
+                    role: reconnectRole,
+                    secretTarget: reconnectRole === "SPY" ? null : chosenSecret,
                     starter: currentStarterName,
                     timeRemaining: timeRemaining,
                     deck: currentDeck,
@@ -759,17 +1000,18 @@ function handleHostMessage(conn, data) {
                 });
                 broadcastPlayerStatusUpdate();
             } else if (gamePhase === 'VOTING') {
-                conn.send({
+                safeSend(conn, {
                     type: 'START_VOTING',
                     players: playerList.map(p => ({ accountId: p.accountId, name: p.name, avatar: p.avatar, isOnline: p.isOnline }))
                 });
                 broadcastPlayerStatusUpdate();
             } else if (gamePhase === 'REVEAL') {
-                if (lastGameOverPayload) conn.send(lastGameOverPayload);
+                if (lastGameOverPayload) safeSend(conn, lastGameOverPayload);
             }
         } else {
             if (gamePhase !== 'LOBBY') {
-                conn.send({ type: 'KICKED', reason: 'Match already in progress.' });
+                safeSend(conn, { type: 'KICKED', reason: 'Match already in progress.' });
+                setTimeout(() => { try { conn.close(); } catch (e) { } }, 150);
                 return;
             }
             hostConnections[conn.peer] = conn;
@@ -796,10 +1038,8 @@ function kickPlayer(accountId) {
     if (player) {
         const conn = hostConnections[player.id];
         if (conn) {
-            try {
-                conn.send({ type: 'KICKED' });
-                setTimeout(() => { conn.close(); }, 100);
-            } catch (e) { }
+            safeSend(conn, { type: 'KICKED' });
+            setTimeout(() => { try { conn.close(); } catch (e) { } }, 100);
             delete hostConnections[player.id];
         }
         playerList = playerList.filter(p => p.accountId !== accountId);
@@ -810,13 +1050,13 @@ function kickPlayer(accountId) {
 
 function broadcastLobbyState() {
     const payload = { type: 'LOBBY_STATE', players: playerList };
-    Object.values(hostConnections).forEach(c => c.send(payload));
+    safeBroadcast(hostConnections, payload);
     renderLobbyList();
 }
 
 function broadcastPlayerStatusUpdate() {
     const payload = { type: 'ROSTER_UPDATE', players: playerList };
-    Object.values(hostConnections).forEach(c => c.send(payload));
+    safeBroadcast(hostConnections, payload);
     renderRosterStatus();
 }
 
@@ -929,7 +1169,9 @@ function hostStartGame() {
         const payload = {
             type: 'GAME_START',
             role: role,
-            secretTarget: chosenSecret,
+            // The Spy must never receive the secret target over the wire - otherwise
+            // opening devtools/network inspector would trivially reveal it.
+            secretTarget: role === "SPY" ? null : chosenSecret,
             starter: currentStarterName,
             timeRemaining: timeRemaining,
             deck: currentDeck,
@@ -939,8 +1181,8 @@ function hostStartGame() {
 
         if (p.isHost) {
             setupClientGameScreen(payload);
-        } else if (hostConnections[p.id]) {
-            hostConnections[p.id].send(payload);
+        } else {
+            safeSend(hostConnections[p.id], payload);
         }
     });
 
@@ -960,7 +1202,7 @@ function hostStartGame() {
 
 function broadcastTimerSync() {
     const payload = { type: 'TIMER_SYNC', timeRemaining: timeRemaining, isPaused: isPaused };
-    Object.values(hostConnections).forEach(c => c.send(payload));
+    safeBroadcast(hostConnections, payload);
     updateTimerDisplay(timeRemaining);
 }
 
@@ -986,8 +1228,8 @@ function hostStartVoting() {
     playerList.forEach(p => {
         if (p.isHost) {
             setupVotingScreen(payload);
-        } else if (hostConnections[p.id]) {
-            hostConnections[p.id].send(payload);
+        } else {
+            safeSend(hostConnections[p.id], payload);
         }
     });
 }
@@ -1045,11 +1287,11 @@ function castVote(targetAccountId, cardElem) {
     if (isHost) {
         votes[userAccount.id] = targetAccountId;
         broadcastVoteProgress();
-    } else {
-        const hostConn = Object.values(myPeer.connections)[0]?.[0];
-        if (hostConn) {
-            hostConn.send({ type: 'SUBMIT_VOTE', voterAccountId: userAccount.id, targetAccountId: targetAccountId });
-        }
+    } else if (!safeSend(myConnection, { type: 'SUBMIT_VOTE', voterAccountId: userAccount.id, targetAccountId: targetAccountId })) {
+        // Vote couldn't be delivered - don't silently pretend it was cast.
+        hasVoted = false;
+        document.querySelectorAll('.vote-card').forEach(c => c.classList.remove('selected'));
+        if (votingStatus) votingStatus.innerText = "Vote failed to send - check your connection and try again.";
     }
 }
 
@@ -1058,7 +1300,7 @@ function broadcastVoteProgress() {
     const total = playerList.length;
     const payload = { type: 'VOTE_SYNC', votedCount: count, totalPlayers: total };
 
-    Object.values(hostConnections).forEach(c => c.send(payload));
+    safeBroadcast(hostConnections, payload);
     updateVoteProgressUI(count, total);
 }
 
@@ -1129,8 +1371,8 @@ function hostConcludeVoting() {
     playerList.forEach(p => {
         if (p.isHost) {
             setupRevealScreen(lastGameOverPayload);
-        } else if (hostConnections[p.id]) {
-            hostConnections[p.id].send(lastGameOverPayload);
+        } else {
+            safeSend(hostConnections[p.id], lastGameOverPayload);
         }
     });
 }
@@ -1156,14 +1398,14 @@ function hostEndGame() {
         votedOutName: "None (Ended by Host)"
     };
 
-    Object.values(hostConnections).forEach(c => c.send(lastGameOverPayload));
+    safeBroadcast(hostConnections, lastGameOverPayload);
     setupRevealScreen(lastGameOverPayload);
 }
 
 function hostReturnToLobby() {
     gamePhase = 'LOBBY';
     const payload = { type: 'RETURN_LOBBY' };
-    Object.values(hostConnections).forEach(c => c.send(payload));
+    safeBroadcast(hostConnections, payload);
     setupLobbyUI();
 }
 
@@ -1172,6 +1414,7 @@ function handleClientMessage(data) {
     if (data.type === 'KICKED') {
         alert(data.reason || "You have been removed from the room.");
         sessionStorage.removeItem('spyfall_active_room');
+        sessionStorage.removeItem('spyfall_active_role');
         location.reload();
         return;
     } else if (data.type === 'LOBBY_STATE') {
@@ -1378,4 +1621,5 @@ function closeModal(modalId) {
 document.addEventListener('DOMContentLoaded', () => {
     initAccount();
     scanAndSyncPresets();
+    setupCropCanvasEvents();
 });
