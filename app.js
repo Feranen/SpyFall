@@ -504,6 +504,8 @@ function deleteAllLocalData() {
         localStorage.removeItem('spyfall_presets');
         sessionStorage.removeItem('spyfall_active_room');
         sessionStorage.removeItem('spyfall_active_role');
+        sessionStorage.removeItem('spyfall_host_state');
+        localStorage.removeItem('spyfall_last_recorded_game');
     } catch (e) {
         console.error("Failed clearing storage:", e);
     }
@@ -563,139 +565,1254 @@ function recordGameEnd(role, won) {
     }
 }
 
+
+// =====================================================================
+// MULTIPLAYER  (host-authoritative, single-snapshot sync)
+// =====================================================================
+//
+// HOW SYNC WORKS (read this before adding features)
+// -------------------------------------------------
+// The host owns ONE state object `G`. Whenever anything changes the host
+// mutates `G` and calls `syncAll()`. syncAll() builds a personalised
+// snapshot for every player (`buildStateFor`) and sends it as a single
+// `STATE` message. Every client (and the host's own UI) renders purely from
+// that snapshot via `applyState()`.
+//
+//   To add a new synced feature:
+//     1. store it in `G`               (newGameState)
+//     2. put it in the snapshot        (buildStateFor)
+//     3. draw it                       (applyState / a render function)
+//     4. after changing it on the host call syncAll()
+//
+// There are no per-feature message types to keep in step any more.
+//
+// HEARTBEAT / RECONNECT
+// ---------------------
+// Client -> host `HB {v}` every few seconds (v = last snapshot version seen).
+// Host answers `HB_ACK` (+ timer) and re-sends the snapshot if `v` is stale,
+// so a client that missed something heals itself. Both sides watch for
+// silence; a silent client is marked OFFLINE on the host, a silent host makes
+// the client auto-reconnect (new peer, same accountId) and re-JOIN. On JOIN
+// the host pushes a full snapshot, so the rejoining player is fully updated.
+// The host persists its state to sessionStorage so a host refresh can resume.
+
+const $ = (id) => document.getElementById(id);
+
+const PEER_PREFIX = "spyfall-dota-";
+const HEARTBEAT_INTERVAL_MS = 3000;
+const HEARTBEAT_TIMEOUT_MS = 11000;
+const CLIENT_MAX_RETRIES = 40;
+const HOST_STATE_KEY = 'spyfall_host_state';
+const LAST_RECORDED_KEY = 'spyfall_last_recorded_game';
+
+// ---- connection state -------------------------------------------------
+let myPeer = null;
+let myPeerId = "";
+let myConnection = null;          // client -> host connection
+let roomCode = "";
+let isHost = false;
+let isConnecting = false;
+let hostPeerHasOpened = false;
+let hostConnections = {};         // host only: peerId -> DataConnection
+let playerList = [];              // host only: authoritative players (has peer ids)
+let viewPlayers = [];             // everyone: players as last rendered from a snapshot
+let myAccountId = "";
+let activeFactsMap = {};
+
+let leaving = false;
+let everJoined = false;           // client: has this session ever been accepted by the host?
+let clientRetries = 0;
+let clientReconnectTimer = null;
+let clientAttemptActive = false;
+let attemptId = 0;
+let clientHbTimer = null;
+let lastHostContactAt = 0;
+let hostMonitorInterval = null;
+let hostResumeTimer = null;
+let lastSigRetryAt = 0;
+let connStateName = 'none';
+let connToastTimer = null;
+const avatarCache = {};           // accountId -> avatar string (host only re-sends on change)
+
+// ---- host-authoritative game state -----------------------------------
+function newGameState() {
+    return {
+        v: 0,                 // bumped on every sync
+        phase: 'LOBBY',       // LOBBY | GAME | VOTING | REVEAL
+        round: 0,
+        gameId: '',
+        secret: '',
+        roles: {},            // accountId -> target | 'SPY' | 'JESTER'
+        deck: [],
+        facts: {},
+        starter: '',
+        timer: { ms: 0, paused: false, at: 0 },
+        votes: {},            // voterAccountId -> targetAccountId
+        result: null
+    };
+}
+let G = newGameState();
+
+// ---- what this client currently displays -----------------------------
+const ui = {
+    lastV: -1,
+    phase: '',
+    shown: '',                // which screen/round is built, so we only rebuild when needed
+    role: '',
+    secret: null,
+    starter: '',
+    deck: [],
+    facts: {},
+    deckGameId: '',
+    gameId: '',
+    timer: { ms: 0, paused: false, at: 0 },
+    voting: null,
+    result: null,
+    roleVisible: false,
+    spyGuessSent: false,
+    pendingGuess: ''
+};
+
+// ---- small helpers ----------------------------------------------------
+function safeSend(conn, payload) {
+    if (!conn || !conn.open) return false;
+    try { conn.send(payload); return true; }
+    catch (e) { console.warn("Send failed to peer " + (conn.peer || '?') + ":", e); return false; }
+}
+
+function hashStr(s) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return h + ':' + s.length;
+}
+
+function avatarKey(p) {
+    if (p._avSrc !== p.avatar) { p._avSrc = p.avatar; p._avKey = hashStr(p.avatar || ''); }
+    return p._avKey;
+}
+
+function shuffle(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+
+function timerMsNow(t) {
+    if (!t) return 0;
+    return Math.max(0, t.paused ? t.ms : t.ms - (Date.now() - t.at));
+}
+
+function playerByPeer(peerId) { return playerList.find(p => p.id === peerId); }
+
+function validateAvatar(raw) {
+    if (!raw || typeof raw !== 'string') return "⚔️";
+    if (raw.startsWith('data:image/')) {
+        const okType = /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,/i.test(raw);
+        if (okType && raw.length <= 400000) return raw;   // hard cap so a bad client can't flood the mesh
+        return "⚔️";
+    }
+    return raw.slice(0, 16);
+}
+
+// ---- connection banner (shows reconnect progress to the user) ---------
+function setConnState(state, text) {
+    const prev = connStateName;
+    connStateName = state;
+    const b = $('conn-banner');
+    if (!b) return;
+    clearTimeout(connToastTimer);
+    if (state === 'none' || (state === 'online' && prev !== 'reconnecting' && prev !== 'offline')) {
+        b.style.display = 'none';
+        return;
+    }
+    b.style.display = 'flex';
+    b.className = 'conn-banner ' + state;
+    $('conn-banner-text').innerText = state === 'online' ? '✅ Connected' : (text || '');
+    $('conn-banner-retry').style.display = state === 'offline' ? 'inline-block' : 'none';
+    $('conn-banner-leave').style.display = state === 'online' ? 'none' : 'inline-block';
+    if (state === 'online') connToastTimer = setTimeout(() => { b.style.display = 'none'; }, 2500);
+}
+
+// ---- session restore --------------------------------------------------
 function checkActiveSession() {
     const lastRoom = sessionStorage.getItem('spyfall_active_room');
     const lastRole = sessionStorage.getItem('spyfall_active_role');
-    if (lastRoom) {
-        const reconnectCode = document.getElementById('reconnect-code');
-        const reconnectBox = document.getElementById('reconnect-box');
-        const reconnectLabel = document.getElementById('reconnect-label');
-        if (reconnectCode) reconnectCode.innerText = lastRoom;
-        if (reconnectBox) reconnectBox.style.display = 'block';
-        if (reconnectLabel) reconnectLabel.innerText = lastRole === 'host' ? 'Resume Hosting Room' : 'Reconnect to Room';
-    }
+    if (!lastRoom) return;
+    if ($('reconnect-code')) $('reconnect-code').innerText = lastRoom;
+    if ($('reconnect-box')) $('reconnect-box').style.display = 'block';
+    if ($('reconnect-label')) $('reconnect-label').innerText = lastRole === 'host' ? 'Resume Hosting Room' : 'Reconnect to Room';
+    reconnectLastRoom();   // page was refreshed mid-session: rejoin automatically
 }
 
 function reconnectLastRoom() {
     const lastRoom = sessionStorage.getItem('spyfall_active_room');
     const lastRole = sessionStorage.getItem('spyfall_active_role');
     if (!lastRoom) return;
-
     if (lastRole === 'host') {
         resumeHostRoom(lastRoom);
     } else {
-        const joinInput = document.getElementById('join-code-input');
-        if (joinInput) joinInput.value = lastRoom;
-        joinRoom();
+        resetNetworking();
+        leaving = false;
+        isHost = false;
+        roomCode = lastRoom;
+        everJoined = true;      // retry quietly instead of alerting on failure
+        clientRetries = 0;
+        setConnState('reconnecting', 'Reconnecting to room ' + lastRoom + '...');
+        clientConnect();
     }
 }
 
-// --- MULTIPLAYER STATE ---
-let myPeer = null;
-let myPeerId = "";
-let myConnection = null; // client's outgoing connection to the host (explicit ref, not peerjs internals)
-let roomCode = "";
-let isHost = false;
-let isConnecting = false;
-let hostPeerHasOpened = false; // true once the host peer has successfully opened at least once
-let gamePhase = 'LOBBY';
-
-let hostConnections = {};
-let playerList = [];
-let hostPeerCheckInterval = null;
-let lastGameOverPayload = null;
-let currentStarterName = "Player";
-
-// --- HEARTBEAT (PeerJS reconnection fallback) ---
-// WebRTC DataChannels can drop silently without ever firing PeerJS's own
-// 'close'/'error' events. A lightweight ping/pong catches that early instead
-// of waiting on the browser's default socket-close detection.
-const HEARTBEAT_INTERVAL_MS = 4000;
-const HEARTBEAT_TIMEOUT_MS = 13000; // ~3 missed beats before we call it dead
-let heartbeatInterval = null;
-let connLastPong = {};      // host-side: peerId -> last time we heard from that peer
-let lastHostContactAt = 0;  // client-side: last time we heard anything from the host
-
-function startHeartbeat() {
-    stopHeartbeat();
-    lastHostContactAt = Date.now();
-    heartbeatInterval = setInterval(() => {
-        if (isHost) {
-            const now = Date.now();
-            Object.keys(hostConnections).forEach(peerId => {
-                if (!connLastPong[peerId]) connLastPong[peerId] = now;
-                safeSend(hostConnections[peerId], { type: 'PING', t: now });
-                if (now - connLastPong[peerId] > HEARTBEAT_TIMEOUT_MS) {
-                    handleHostConnectionDrop(peerId);
-                }
-            });
-        } else if (myConnection) {
-            safeSend(myConnection, { type: 'PING', t: Date.now() });
-            if (Date.now() - lastHostContactAt > HEARTBEAT_TIMEOUT_MS) {
-                console.warn("Heartbeat timeout - host appears unreachable.");
-                try { myConnection.close(); } catch (e) { }
-            }
-        }
-    }, HEARTBEAT_INTERVAL_MS);
+function leaveRoom() {
+    leaving = true;
+    resetNetworking();
+    sessionStorage.removeItem('spyfall_active_room');
+    sessionStorage.removeItem('spyfall_active_role');
+    sessionStorage.removeItem(HOST_STATE_KEY);
+    location.reload();
 }
 
-function stopHeartbeat() {
-    if (heartbeatInterval) clearInterval(heartbeatInterval);
-    heartbeatInterval = null;
-    connLastPong = {};
-}
-
-// Host-side: a peer's heartbeat has gone silent for too long - treat exactly
-// like a normal PeerJS 'close' event so the rest of the app (lobby/roster
-// updates) reacts the same way regardless of how the drop was detected.
-function handleHostConnectionDrop(peerId) {
-    const conn = hostConnections[peerId];
-    delete hostConnections[peerId];
-    delete connLastPong[peerId];
-    if (conn) {
-        try { conn.close(); } catch (e) { }
-    }
-    const p = playerList.find(pl => pl.id === peerId);
-    if (p && p.isOnline) {
-        p.isOnline = false;
-        if (gamePhase === 'LOBBY') broadcastLobbyState();
-        else broadcastPlayerStatusUpdate();
+function teardownPeer() {
+    if (myPeer) {
+        const p = myPeer;
+        myPeer = null;
+        try { p.destroy(); } catch (e) { }
     }
 }
 
-// --- SPY GUESS STATE ---
-let spyGuessResolved = false; // guards against multiple guesses ending the round twice
-
-// Send helper: never let a single dead/throwing connection break a broadcast loop.
-function safeSend(conn, payload) {
-    if (!conn || !conn.open) return false;
-    try {
-        conn.send(payload);
-        return true;
-    } catch (e) {
-        console.warn("Send failed to peer " + (conn.peer || '?') + ":", e);
-        return false;
+// Stops every timer / connection. Safe to call at any time.
+function resetNetworking() {
+    clearTimeout(clientReconnectTimer); clientReconnectTimer = null;
+    clearTimeout(hostResumeTimer); hostResumeTimer = null;
+    stopClientHeartbeat();
+    if (hostMonitorInterval) { clearInterval(hostMonitorInterval); hostMonitorInterval = null; }
+    attemptId++;
+    clientAttemptActive = false;
+    isConnecting = false;
+    if (myConnection) {
+        const c = myConnection;
+        myConnection = null;
+        try { c.close(); } catch (e) { }
     }
+    teardownPeer();
+    hostConnections = {};
+    setConnState('none');
 }
 
-function safeBroadcast(connsObj, payload) {
-    Object.keys(connsObj).forEach(peerId => {
-        safeSend(connsObj[peerId], payload);
+// =====================================================================
+// HOST: room creation / resume
+// =====================================================================
+async function createRoom() {
+    if (isConnecting) return;
+    const nameInput = $('player-name');
+    if (nameInput) updateAccountName(nameInput.value);
+    await scanAndSyncPresets();
+    sessionStorage.removeItem(HOST_STATE_KEY);
+    initHostPeer(generateRoomCode(), false, 0);
+}
+
+function resumeHostRoom(code) {
+    if (!code) return;
+    initHostPeer(code, true, 0);
+}
+
+function refreshHostSelf() {
+    let me = playerList.find(p => p.isHost);
+    if (!me) { me = { isHost: true }; playerList.unshift(me); }
+    Object.assign(me, {
+        id: myPeerId, accountId: userAccount.id, name: sanitizeName(userAccount.username, 'Host'),
+        avatar: userAccount.avatar, level: userAccount.level, isHost: true, isOnline: true, lastSeen: Date.now()
     });
 }
 
-let currentDeck = [];
-let activeFactsMap = {};
-let chosenSecret = "";
-let gameRoles = {};
-let myAssignedRole = "";
-let timeRemaining = 0;
-let timerInterval = null;
-let isPaused = false;
-let roleCardVisible = false;
+function persistHost() {
+    if (!isHost) return;
+    try {
+        sessionStorage.setItem(HOST_STATE_KEY, JSON.stringify({
+            roomCode,
+            G: Object.assign({}, G, { timer: { ms: timerMsNow(G.timer), paused: G.timer.paused, at: 0 } }),
+            players: playerList.map(p => ({
+                accountId: p.accountId, name: p.name, level: p.level, isHost: !!p.isHost,
+                avatar: (typeof p.avatar === 'string' && p.avatar.startsWith('data:')) ? "⚔️" : p.avatar
+            }))
+        }));
+    } catch (e) { /* storage full / unavailable - resume just falls back to a fresh lobby */ }
+}
 
-let votes = {};
-let hasVoted = false;
+function restoreHostState() {
+    try {
+        const raw = sessionStorage.getItem(HOST_STATE_KEY);
+        if (!raw) return false;
+        const s = JSON.parse(raw);
+        if (!s || s.roomCode !== roomCode || !s.G) return false;
+        G = Object.assign(newGameState(), s.G);
+        // Time kept running while the host was gone would be unfair - come back paused.
+        G.timer = { ms: (s.G.timer && s.G.timer.ms) || 0, paused: true, at: Date.now() };
+        playerList = (s.players || []).map(p => Object.assign({}, p, { id: '', isOnline: false, lastSeen: 0 }));
+        return true;
+    } catch (e) { return false; }
+}
+
+function initHostPeer(code, isResume, attempt) {
+    resetNetworking();
+    leaving = false;
+    roomCode = code;
+    myPeerId = PEER_PREFIX + code;
+    isHost = true;
+    isConnecting = true;
+    hostPeerHasOpened = false;
+    myAccountId = userAccount.id;
+
+    sessionStorage.setItem('spyfall_active_room', roomCode);
+    sessionStorage.setItem('spyfall_active_role', 'host');
+
+    updateStatus(isResume ? "Resuming host session..." : "Initializing host peer...");
+    const peer = new Peer(myPeerId);
+    myPeer = peer;
+
+    peer.on('open', () => {
+        if (myPeer !== peer) return;
+        hostPeerHasOpened = true;
+        isConnecting = false;
+
+        if (isResume && restoreHostState()) {
+            updateStatus("Room resumed. Waiting for players to rejoin...");
+        } else {
+            G = newGameState();
+            playerList = [];
+            updateStatus(isResume ? "Room resumed (fresh lobby)." : "Connected as Host.");
+        }
+        refreshHostSelf();
+        hostMonitorInterval = setInterval(hostMonitorTick, 1500);
+        syncAll();
+    });
+
+    peer.on('connection', (conn) => {
+        conn.on('data', (data) => handleHostMessage(conn, data));
+        conn.on('close', () => onHostConnClosed(conn));
+        conn.on('error', (e) => console.warn("Host conn error:", e));
+    });
+
+    // Signaling server dropped: existing player connections keep working, we just
+    // need to get back on the server so NEW/returning players can find the room.
+    peer.on('disconnected', () => {
+        if (myPeer !== peer || peer.destroyed) return;
+        setConnState('reconnecting', 'Lost signaling server, reconnecting...');
+    });
+
+    peer.on('error', (err) => {
+        if (myPeer !== peer) return;
+        isConnecting = false;
+        if (!hostPeerHasOpened) {
+            if (err.type === 'unavailable-id') {
+                if (isResume && attempt < 8) {
+                    updateStatus(`Waiting for old room to be released... (${attempt + 1}/8)`);
+                    hostResumeTimer = setTimeout(() => initHostPeer(code, true, attempt + 1), 3000);
+                } else if (isResume) {
+                    alert("This room code isn't free to resume yet. Wait a few seconds and press Resume again, or host a new game.");
+                    updateStatus("Disconnected.");
+                } else {
+                    initHostPeer(generateRoomCode(), false, 0);
+                }
+            } else {
+                alert("Could not start the room (" + err.type + "). Please try again.");
+                updateStatus("Disconnected.");
+            }
+            return;
+        }
+        // A hiccup after the room is live must never kill the room.
+        console.warn("Host peer error (room kept alive):", err.type);
+    });
+}
+
+// Runs every 1.5s on the host: heartbeat watchdog, timer expiry, signaling repair.
+function hostMonitorTick() {
+    if (!isHost) return;
+    const now = Date.now();
+    let changed = false;
+
+    playerList.forEach(p => {
+        if (p.isHost || !p.isOnline) return;
+        const conn = hostConnections[p.id];
+        if (!conn || !conn.open || now - (p.lastSeen || 0) > HEARTBEAT_TIMEOUT_MS) {
+            delete hostConnections[p.id];
+            if (conn) { try { conn.close(); } catch (e) { } }
+            p.isOnline = false;
+            changed = true;
+        }
+    });
+
+    if (myPeer && !myPeer.destroyed && myPeer.disconnected) {
+        setConnState('reconnecting', 'Lost signaling server, reconnecting...');
+        if (now - lastSigRetryAt > 4000) {
+            lastSigRetryAt = now;
+            try { myPeer.reconnect(); } catch (e) { }
+        }
+    } else if (connStateName === 'reconnecting') {
+        setConnState('online');
+    }
+
+    if (G.phase === 'GAME') {
+        if (!G.timer.paused && timerMsNow(G.timer) <= 0) { hostStartVoting(); return; }
+        persistHost();    // keep the clock fresh in case the host refreshes
+    }
+    if (changed) syncAll();
+}
+
+function onHostConnClosed(conn) {
+    if (hostConnections[conn.peer] !== conn) return;   // stale conn that was already replaced
+    delete hostConnections[conn.peer];
+    const p = playerByPeer(conn.peer);
+    if (p && p.isOnline) { p.isOnline = false; syncAll(); }
+}
+
+// =====================================================================
+// HOST: snapshot building & broadcasting
+// =====================================================================
+function buildStateFor(p, conn) {
+    const s = {
+        type: 'STATE', v: G.v, phase: G.phase, round: G.round, gameId: G.gameId,
+        room: roomCode, me: p.accountId,
+        players: playerList.map(q => {
+            const key = avatarKey(q);
+            const o = { accountId: q.accountId, name: q.name, level: q.level, isHost: !!q.isHost, isOnline: !!q.isOnline, avKey: key };
+            // Avatars can be tens of KB: only send when this connection hasn't seen this version.
+            if (!conn || conn._avSent[q.accountId] !== key) {
+                o.avatar = q.avatar;
+                if (conn) conn._avSent[q.accountId] = key;
+            }
+            return o;
+        })
+    };
+
+    if (G.phase !== 'LOBBY') {
+        const role = G.roles[p.accountId] || '';
+        s.game = {
+            role,
+            // The Spy must never receive the secret over the wire.
+            secretTarget: role === 'SPY' ? null : G.secret,
+            starter: G.starter,
+            timer: { ms: timerMsNow(G.timer), paused: G.timer.paused }
+        };
+        if (!conn || conn._deckSentFor !== G.gameId) {
+            s.game.deck = G.deck;
+            s.game.facts = G.facts;
+            if (conn) conn._deckSentFor = G.gameId;
+        }
+    }
+    if (G.phase === 'VOTING') {
+        s.voting = { votedCount: Object.keys(G.votes).length, total: playerList.length, myVote: G.votes[p.accountId] || null };
+    }
+    if (G.phase === 'REVEAL') s.result = G.result;
+    return s;
+}
+
+function sendStateTo(p) {
+    const conn = hostConnections[p.id];
+    if (!conn || !conn.open) return false;
+    if (!conn._avSent) conn._avSent = {};
+    return safeSend(conn, buildStateFor(p, conn));
+}
+
+// THE one call to make after ANY change to G or playerList.
+function syncAll() {
+    if (!isHost) return;
+    G.v++;
+    refreshHostSelf();
+    persistHost();
+    playerList.forEach(p => {
+        if (p.isHost) applyState(buildStateFor(p, null));
+        else sendStateTo(p);
+    });
+}
+
+// =====================================================================
+// HOST: incoming messages
+// =====================================================================
+function handleHostMessage(conn, data) {
+    if (!data || typeof data !== 'object') return;
+    const p = playerByPeer(conn.peer);
+    if (p) p.lastSeen = Date.now();
+
+    switch (data.type) {
+        case 'JOIN':
+            hostHandleJoin(conn, data);
+            break;
+
+        case 'HB':
+            if (!p || hostConnections[conn.peer] !== conn) { safeSend(conn, { type: 'REJOIN' }); return; }
+            safeSend(conn, { type: 'HB_ACK', v: G.v, phase: G.phase, timer: { ms: timerMsNow(G.timer), paused: G.timer.paused } });
+            if (data.v !== G.v) sendStateTo(p);      // client missed something -> heal
+            break;
+
+        case 'RESYNC':
+            if (!p) return;
+            if (conn._avSent) conn._avSent = {};
+            conn._deckSentFor = null;
+            sendStateTo(p);
+            break;
+
+        case 'VOTE': {
+            if (!p || G.phase !== 'VOTING') return;
+            if (!playerList.some(x => x.accountId === data.target)) return;   // reject spoofed targets
+            if (G.votes[p.accountId]) return;                                  // one vote each
+            G.votes[p.accountId] = data.target;
+            syncAll();
+            break;
+        }
+
+        case 'SPY_GUESS':
+            if (!p || G.phase !== 'GAME' || G.roles[p.accountId] !== 'SPY') return;
+            hostResolveSpyGuess(p.accountId, typeof data.guess === 'string' ? data.guess : '');
+            break;
+    }
+}
+
+function hostHandleJoin(conn, data) {
+    const accId = typeof data.accountId === 'string' ? data.accountId.slice(0, 64) : conn.peer;
+    const name = sanitizeName(data.name, "Player");
+    const avatar = validateAvatar(data.avatar);
+    const level = Number.isFinite(data.level) ? data.level : 1;
+    let p = playerList.find(x => x.accountId === accId);
+
+    if (p) {
+        if (p.isHost) {
+            safeSend(conn, { type: 'KICKED', reason: 'That account is the room host.' });
+            setTimeout(() => { try { conn.close(); } catch (e) { } }, 150);
+            return;
+        }
+        // Reconnect of a known player: drop the old (probably dead) link first.
+        const oldConn = hostConnections[p.id];
+        if (oldConn && oldConn !== conn) {
+            delete hostConnections[p.id];
+            try { oldConn.close(); } catch (e) { }
+        }
+        p.id = conn.peer;
+        p.name = name; p.avatar = avatar; p.level = level;
+    } else {
+        if (G.phase !== 'LOBBY') {
+            safeSend(conn, { type: 'KICKED', reason: 'Match already in progress.' });
+            setTimeout(() => { try { conn.close(); } catch (e) { } }, 150);
+            return;
+        }
+        p = { id: conn.peer, accountId: accId, name, avatar, level, isHost: false };
+        playerList.push(p);
+    }
+
+    conn._avSent = {};
+    conn._deckSentFor = null;
+    hostConnections[conn.peer] = conn;
+    p.isOnline = true;
+    p.lastSeen = Date.now();
+    syncAll();     // rejoining player gets a full snapshot; everyone else sees them come back online
+}
+
+function kickPlayer(accountId) {
+    if (!isHost) return;
+    const p = playerList.find(x => x.accountId === accountId);
+    if (!p || p.isHost) return;
+    const conn = hostConnections[p.id];
+    if (conn) {
+        safeSend(conn, { type: 'KICKED' });
+        delete hostConnections[p.id];
+        setTimeout(() => { try { conn.close(); } catch (e) { } }, 150);
+    }
+    playerList = playerList.filter(x => x.accountId !== accountId);
+    delete G.roles[accountId];
+    delete G.votes[accountId];
+    syncAll();
+}
+
+// =====================================================================
+// HOST: game actions (mutate G, then syncAll)
+// =====================================================================
+function hostStartGame() {
+    if (!isHost || G.phase !== 'LOBBY') return;
+    const spyCount = Math.min(3, Math.max(1, parseInt($('spy-count').value) || 1));
+    const enableJester = $('enable-impostor').checked;
+    const timeMins = Math.min(15, Math.max(1, parseInt($('round-time').value) || 6));
+
+    if (spyCount + (enableJester ? 1 : 0) >= playerList.length) {
+        alert("Spies + Jester must be fewer than total players in the room!");
+        return;
+    }
+    const preset = getStoredPresets()[$('preset-select').value];
+    if (!preset || !preset.items || preset.items.length < 3) {
+        alert("Invalid preset! Please select a valid word pack with at least 3 items.");
+        return;
+    }
+    if (playerList.some(p => !p.isOnline) && !confirm("Some players are offline right now. Start anyway? (They can rejoin and will get their role.)")) return;
+
+    G.deck = [...preset.items];
+    G.facts = preset.facts || {};
+    G.secret = G.deck[Math.floor(Math.random() * G.deck.length)];
+
+    const ids = shuffle(playerList.map(p => p.accountId));
+    G.roles = {};
+    ids.forEach(id => G.roles[id] = G.secret);
+    ids.slice(0, spyCount).forEach(id => G.roles[id] = 'SPY');
+    if (enableJester) G.roles[ids[spyCount]] = 'JESTER';
+
+    const online = playerList.filter(p => p.isOnline);
+    G.starter = (online.length ? online : playerList)[Math.floor(Math.random() * (online.length || playerList.length))].name;
+    G.timer = { ms: timeMins * 60000, paused: false, at: Date.now() };
+    G.votes = {};
+    G.result = null;
+    G.round++;
+    G.gameId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    G.phase = 'GAME';
+    syncAll();
+}
+
+function hostToggleTimer() {
+    if (!isHost || G.phase !== 'GAME') return;
+    const now = Date.now();
+    if (G.timer.paused) {
+        G.timer.paused = false;
+        G.timer.at = now;
+    } else {
+        G.timer.ms = timerMsNow(G.timer);
+        G.timer.paused = true;
+        G.timer.at = now;
+    }
+    syncAll();
+}
+
+function hostStartVoting() {
+    if (!isHost || G.phase !== 'GAME') return;
+    G.phase = 'VOTING';
+    G.votes = {};
+    syncAll();
+}
+
+function buildResult(winner, votedOutName) {
+    const spies = [];
+    let jester = null;
+    playerList.forEach(p => {
+        const r = G.roles[p.accountId];
+        if (r === 'SPY') spies.push(p.name);
+        if (r === 'JESTER') jester = p.name;
+    });
+    return { secretTarget: G.secret, spies, jester, winner, votedOutName };
+}
+
+function hostConcludeVoting() {
+    if (!isHost || G.phase !== 'VOTING') return;
+    const tally = {};
+    Object.values(G.votes).forEach(t => { if (t) tally[t] = (tally[t] || 0) + 1; });
+
+    let maxVotes = 0, votedOutId = null, isTie = false;
+    Object.keys(tally).forEach(id => {
+        if (tally[id] > maxVotes) { maxVotes = tally[id]; votedOutId = id; isTie = false; }
+        else if (tally[id] === maxVotes) isTie = true;
+    });
+
+    let winner = 'SPIES';
+    let votedOut = null;
+    if (!isTie && votedOutId) {
+        votedOut = playerList.find(p => p.accountId === votedOutId);
+        const role = G.roles[votedOutId];
+        winner = role === 'JESTER' ? 'JESTER' : (role === 'SPY' ? 'INNOCENTS' : 'SPIES');
+    }
+    G.result = buildResult(winner, votedOut ? votedOut.name : (isTie ? "Nobody (Tie Vote)" : "Nobody"));
+    G.phase = 'REVEAL';
+    syncAll();
+}
+
+function hostEndGame() {
+    if (!isHost || (G.phase !== 'GAME' && G.phase !== 'VOTING')) return;
+    G.result = buildResult('SPIES', "None (Ended by Host)");
+    G.phase = 'REVEAL';
+    syncAll();
+}
+
+function hostResolveSpyGuess(guesserAccountId, guess) {
+    if (G.phase !== 'GAME') return;
+    if (!G.deck.includes(guess)) return;                       // must be a real target from the pool
+    const correct = guess === G.secret;
+    const guesser = playerList.find(p => p.accountId === guesserAccountId);
+    G.result = buildResult(correct ? 'SPIES' : 'INNOCENTS',
+        `None - ${guesser ? guesser.name : 'The Spy'} guessed "${guess}" (${correct ? 'Correct!' : 'Wrong!'})`);
+    G.phase = 'REVEAL';
+    syncAll();
+}
+
+function hostReturnToLobby() {
+    if (!isHost) return;
+    G.phase = 'LOBBY';
+    G.roles = {};
+    G.votes = {};
+    G.result = null;
+    syncAll();
+}
+
+// =====================================================================
+// CLIENT: connecting, heartbeat, auto-reconnect
+// =====================================================================
+function joinRoom() {
+    if (isConnecting) return;
+    const nameInput = $('player-name');
+    if (nameInput) updateAccountName(nameInput.value);
+
+    const code = $('join-code-input').value.trim().toUpperCase();
+    if (code.length < 4) { alert("Please enter a valid 4-character Room Code!"); return; }
+
+    resetNetworking();
+    leaving = false;
+    isHost = false;
+    roomCode = code;
+    everJoined = false;
+    clientRetries = 0;
+    sessionStorage.setItem('spyfall_active_room', roomCode);
+    sessionStorage.setItem('spyfall_active_role', 'client');
+    const joinBtn = $('join-btn');
+    if (joinBtn) joinBtn.disabled = true;
+    clientConnect();
+}
+
+function sendJoin() {
+    safeSend(myConnection, {
+        type: 'JOIN', accountId: userAccount.id, name: userAccount.username,
+        avatar: userAccount.avatar, level: userAccount.level
+    });
+}
+
+function clientConnect() {
+    if (clientAttemptActive || leaving) return;
+    clientAttemptActive = true;
+    isConnecting = true;
+    const attempt = ++attemptId;
+    teardownPeer();
+    updateStatus(everJoined ? "Reconnecting..." : "Connecting to host...");
+
+    let done = false;
+    const joinBtn = $('join-btn');
+    const finish = () => { done = true; clientAttemptActive = false; isConnecting = false; clearTimeout(openTimer); if (joinBtn) joinBtn.disabled = false; };
+    const fail = (why) => {
+        if (done || attempt !== attemptId) return;
+        finish();
+        teardownPeer();
+        if (!everJoined) {
+            sessionStorage.removeItem('spyfall_active_room');
+            sessionStorage.removeItem('spyfall_active_role');
+            alert(why === 'peer-unavailable'
+                ? "Room " + roomCode + " was not found. Check the code and try again."
+                : "Could not connect to room " + roomCode + " (" + why + "). Check the code and try again.");
+            updateStatus("Disconnected.");
+            return;
+        }
+        scheduleClientReconnect();
+    };
+    const openTimer = setTimeout(() => fail('timeout'), 12000);
+
+    const peer = new Peer();
+    myPeer = peer;
+
+    peer.on('open', (id) => {
+        if (myPeer !== peer) return;
+        myPeerId = id;
+        const conn = peer.connect(PEER_PREFIX + roomCode, { reliable: true });
+
+        conn.on('open', () => {
+            if (done || attempt !== attemptId) { try { conn.close(); } catch (e) { } return; }
+            finish();
+            myConnection = conn;
+            everJoined = true;
+            clientRetries = 0;
+            lastHostContactAt = Date.now();
+            updateStatus("Connected to room " + roomCode);
+            setConnState('online');
+            startClientHeartbeat();
+            sendJoin();
+        });
+        conn.on('data', (d) => { if (myConnection === conn) handleClientMessage(d); });
+        conn.on('close', () => {
+            if (myConnection === conn) { myConnection = null; onClientLinkLost('closed'); }
+            else fail('closed');
+        });
+        conn.on('error', (e) => console.warn("Client connection error:", e));
+    });
+
+    // Signaling-only drop: the data channel to the host may still be fine, so just repair the socket.
+    peer.on('disconnected', () => {
+        if (myPeer !== peer || peer.destroyed) return;
+        try { peer.reconnect(); } catch (e) { }
+    });
+    peer.on('error', (err) => { if (myPeer === peer) fail(err.type); });
+}
+
+function scheduleClientReconnect() {
+    if (leaving || clientReconnectTimer) return;
+    if (clientRetries >= CLIENT_MAX_RETRIES) {
+        setConnState('offline', 'Could not reach the host. Tap Retry or Leave.');
+        updateStatus("Disconnected.");
+        return;
+    }
+    clientRetries++;
+    const delay = clientRetries === 1 ? 300 : Math.min(1000 * clientRetries, 5000);
+    setConnState('reconnecting', `Connection lost - reconnecting... (attempt ${clientRetries})`);
+    updateStatus("Reconnecting...");
+    clientReconnectTimer = setTimeout(() => { clientReconnectTimer = null; clientConnect(); }, delay);
+}
+
+function onClientLinkLost(reason) {
+    if (leaving) return;
+    console.warn("Link to host lost:", reason);
+    stopClientHeartbeat();
+    if (myConnection) {
+        const c = myConnection;
+        myConnection = null;
+        try { c.close(); } catch (e) { }
+    }
+    scheduleClientReconnect();
+}
+
+function startClientHeartbeat() {
+    stopClientHeartbeat();
+    lastHostContactAt = Date.now();
+    clientHbTimer = setInterval(() => {
+        if (!myConnection) return;
+        if (Date.now() - lastHostContactAt > HEARTBEAT_TIMEOUT_MS) { onClientLinkLost('heartbeat timeout'); return; }
+        safeSend(myConnection, { type: 'HB', v: ui.lastV });
+    }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopClientHeartbeat() {
+    if (clientHbTimer) clearInterval(clientHbTimer);
+    clientHbTimer = null;
+}
+
+function handleClientMessage(data) {
+    if (!data || typeof data !== 'object') return;
+    lastHostContactAt = Date.now();     // ANY message proves the link is alive
+
+    switch (data.type) {
+        case 'STATE':
+            applyState(data);
+            break;
+        case 'HB_ACK':
+            if (data.timer && ui.phase === 'GAME') ui.timer = { ms: data.timer.ms, paused: !!data.timer.paused, at: Date.now() };
+            break;
+        case 'REJOIN':
+            sendJoin();
+            break;
+        case 'KICKED':
+            leaving = true;
+            alert(data.reason || "You have been removed from the room.");
+            sessionStorage.removeItem('spyfall_active_room');
+            sessionStorage.removeItem('spyfall_active_role');
+            location.reload();
+            break;
+    }
+}
+
+// Phones freeze background tabs: when we come back, check the link right away.
+function onAppResumed() {
+    if (document.hidden) return;
+    const now = Date.now();
+    if (isHost) {
+        playerList.forEach(p => { if (!p.isHost && p.isOnline) p.lastSeen = now; });   // grace: we were asleep, not them
+        hostMonitorTick();
+    } else if (roomCode && sessionStorage.getItem('spyfall_active_role') === 'client' && !leaving) {
+        if (myConnection && myConnection.open) {
+            lastHostContactAt = now;
+            safeSend(myConnection, { type: 'HB', v: ui.lastV });
+        } else if (!clientAttemptActive) {
+            if (connStateName === 'offline') clientRetries = 0;
+            clearTimeout(clientReconnectTimer);
+            clientReconnectTimer = null;
+            clientConnect();
+        }
+    }
+}
+
+// =====================================================================
+// RENDERING FROM A SNAPSHOT (used by clients AND by the host's own UI)
+// =====================================================================
+function applyState(s) {
+    if (!s || !Array.isArray(s.players)) return;
+    ui.lastV = s.v;
+    if (s.room) roomCode = s.room;
+    myAccountId = s.me || myAccountId;
+
+    s.players.forEach(p => {
+        if (p.avatar !== undefined) avatarCache[p.accountId] = p.avatar;
+        else p.avatar = avatarCache[p.accountId];
+    });
+    viewPlayers = s.players;
+
+    const prevShown = ui.shown;
+    ui.phase = s.phase;
+    ui.gameId = s.gameId;
+
+    if (s.game) {
+        if (s.game.deck) {
+            ui.deck = s.game.deck;
+            ui.facts = s.game.facts || {};
+            ui.deckGameId = s.gameId;
+        } else if (ui.deckGameId !== s.gameId && !isHost) {
+            safeSend(myConnection, { type: 'RESYNC' });     // we're missing the deck for this round
+        }
+        activeFactsMap = ui.facts;
+        ui.role = s.game.role;
+        ui.secret = s.game.secretTarget;
+        ui.starter = s.game.starter;
+        ui.timer = { ms: s.game.timer.ms, paused: !!s.game.timer.paused, at: Date.now() };
+    }
+    ui.voting = s.voting || null;
+
+    switch (s.phase) {
+        case 'LOBBY':
+            if (prevShown !== 'LOBBY') {
+                setupLobbyUI();
+                ui.shown = 'LOBBY';
+                if (prevShown && !isHost) sendJoin();       // back from a round: refresh my level/name for others
+            } else {
+                setupLobbyUI();
+            }
+            break;
+
+        case 'GAME':
+            if (prevShown !== 'GAME:' + s.gameId) {
+                buildGameScreen();
+                ui.shown = 'GAME:' + s.gameId;
+            }
+            renderRosterStatus();
+            refreshGameControls();
+            updateTimerDisplay(Math.ceil(uiTimerMs() / 1000));
+            break;
+
+        case 'VOTING':
+            ui.shown = 'VOTING:' + s.gameId;
+            renderVotingScreen();
+            break;
+
+        case 'REVEAL':
+            if (prevShown !== 'REVEAL:' + s.gameId) {
+                ui.result = s.result;
+                ui.shown = 'REVEAL:' + s.gameId;
+                setupRevealScreen(s.result);
+            }
+            break;
+    }
+
+    if (s.phase !== 'GAME') closeModal('spy-guess-modal');
+}
+
+function uiTimerMs() { return timerMsNow(ui.timer); }
+
+// Runs 4x/second on everyone: smooth local countdown between syncs.
+function uiTick() {
+    if (ui.phase === 'GAME') updateTimerDisplay(Math.ceil(uiTimerMs() / 1000));
+}
+
+function setupLobbyUI() {
+    if ($('lobby-room-code')) $('lobby-room-code').innerText = roomCode;
+    if ($('host-settings')) $('host-settings').style.display = isHost ? 'block' : 'none';
+    if ($('client-waiting')) $('client-waiting').style.display = isHost ? 'none' : 'block';
+    if (isHost) populatePresetDropdown();
+    renderLobbyList();
+    showScreen('screen-lobby');
+}
+
+function statusPill(p, offlineText) {
+    return p.isOnline
+        ? '<span class="status-pill online">ONLINE</span>'
+        : `<span class="status-pill offline">${offlineText}</span>`;
+}
+
+function renderLobbyList() {
+    const listElem = $('lobby-player-list');
+    if (!listElem) return;
+    listElem.innerHTML = '';
+    viewPlayers.forEach(p => {
+        const div = document.createElement('div');
+        div.className = `player-item ${!p.isOnline ? 'offline' : ''}`;
+        const safeAccId = escapeHtml(String(p.accountId));
+        const kickBtnHtml = (isHost && !p.isHost)
+            ? `<button class="sm-btn" style="background:var(--accent-red); color:#fff; margin-left:8px;" onclick="kickPlayer('${safeAccId}')">Remove</button>`
+            : '';
+        div.innerHTML = `
+            <div class="player-item-left">
+                <span class="account-avatar" style="width:28px; height:28px; border:none;">${renderAvatarHTML(p.avatar)}</span>
+                <strong>${escapeHtml(p.name)}</strong>
+                <span class="account-level-badge">Lvl ${Number.isFinite(p.level) ? p.level : 1}</span>
+                ${statusPill(p, 'DISCONNECTED')}
+            </div>
+            <div>
+                ${p.isHost ? '<span class="player-host-badge">[HOST]</span>' : ''}
+                ${kickBtnHtml}
+            </div>`;
+        listElem.appendChild(div);
+    });
+}
+
+function renderRosterStatus() {
+    const container = $('game-roster-status');
+    if (!container) return;
+    container.innerHTML = '';
+    viewPlayers.forEach(p => {
+        const div = document.createElement('div');
+        div.className = `player-item ${!p.isOnline ? 'offline' : ''}`;
+        div.innerHTML = `
+            <div class="player-item-left">
+                <span style="width:24px; height:24px; display:inline-block;">${renderAvatarHTML(p.avatar)}</span>
+                <strong>${escapeHtml(p.name)}</strong>
+            </div>
+            <div>${statusPill(p, 'RECONNECTING...')}</div>`;
+        container.appendChild(div);
+    });
+}
+
+// Built once per round (so role-reveal state isn't wiped by every snapshot).
+function buildGameScreen() {
+    ui.roleVisible = false;
+    ui.spyGuessSent = false;
+    ui.pendingGuess = '';
+
+    $('first-player').innerText = ui.starter;
+    $('role-card-hidden').style.display = 'block';
+    $('role-card-content').style.display = 'none';
+    $('toggle-role-btn').innerText = "👁️ Reveal My Secret Role";
+
+    const title = $('role-title'), val = $('role-value'), box = $('facts-box'), content = $('facts-content');
+    box.className = "facts-box";
+
+    if (ui.role === "SPY") {
+        title.innerText = "YOU ARE THE";
+        val.innerText = "SPY!";
+        val.className = "role-value spy";
+        content.innerHTML = "You don't know the secret hero or location! Ask clever questions and listen carefully to stay hidden. When you think you know it, use the guess button below.";
+    } else if (ui.role === "JESTER") {
+        title.innerText = "YOU ARE THE";
+        val.innerText = "JESTER!";
+        val.className = "role-value jester";
+        box.className = "facts-box jester-rules";
+        content.innerHTML = `<strong>Target:</strong> ${escapeHtml(ui.secret || '')}<br>
+        <strong>Facts:</strong> ${escapeHtml(getFacts(ui.secret))}<br><br>
+        🃏 <strong>OBJECTIVE:</strong> You know the hero! You don't want to blend in - you want to get voted out. Act suspicious and bait the group into voting for YOU. If they vote you out, YOU WIN!`;
+    } else {
+        title.innerText = "SECRET TARGET:";
+        val.innerText = ui.role;
+        val.className = "role-value";
+        content.innerHTML = `<strong>Traits/Facts:</strong> ${escapeHtml(getFacts(ui.role))}`;
+    }
+
+    const grid = $('deck-grid');
+    if (grid) {
+        grid.innerHTML = '';
+        ui.deck.slice().sort().forEach(item => {
+            const div = document.createElement('div');
+            div.className = 'hero-item';
+            div.innerText = item;
+            div.onclick = () => openModal('fact-modal', item);
+            grid.appendChild(div);
+        });
+    }
+    showScreen('screen-game');
+}
+
+// Cheap, idempotent: called on every snapshot and whenever the role card is toggled.
+function refreshGameControls() {
+    // The guess button lives INSIDE the role card and only shows for a Spy who is looking at their role.
+    const guessBtn = $('spy-guess-btn');
+    if (guessBtn) {
+        const show = ui.role === "SPY" && ui.roleVisible && ui.phase === 'GAME';
+        guessBtn.style.display = show ? 'block' : 'none';
+        guessBtn.disabled = ui.spyGuessSent;
+        guessBtn.innerText = ui.spyGuessSent ? '⏳ Guess sent...' : '🎯 Guess Secret Target';
+    }
+    const hostControls = $('host-game-controls');
+    if (hostControls) hostControls.style.display = isHost ? 'flex' : 'none';
+    const pauseBtn = $('pause-btn');
+    if (pauseBtn) pauseBtn.innerText = ui.timer.paused ? "Resume" : "Pause";
+}
+
+function toggleRoleVisibility() {
+    ui.roleVisible = !ui.roleVisible;
+    $('role-card-hidden').style.display = ui.roleVisible ? 'none' : 'block';
+    $('role-card-content').style.display = ui.roleVisible ? 'block' : 'none';
+    $('toggle-role-btn').innerText = ui.roleVisible ? "🙈 Hide Role Card" : "👁️ Reveal My Secret Role";
+    if (!ui.roleVisible) closeModal('spy-guess-modal');
+    refreshGameControls();
+}
+
+function updateTimerDisplay(seconds) {
+    const el = $('timer-display');
+    if (!el) return;
+    const s = Math.max(0, seconds);
+    el.innerText = `${Math.floor(s / 60).toString().padStart(2, '0')}:${(s % 60).toString().padStart(2, '0')}`;
+}
+
+// ---- voting ----------------------------------------------------------
+function renderVotingScreen() {
+    const list = $('voting-target-list');
+    if (!list) return;
+    const v = ui.voting || { votedCount: 0, total: viewPlayers.length, myVote: null };
+    list.innerHTML = '';
+
+    viewPlayers.forEach(p => {
+        const div = document.createElement('div');
+        div.className = `vote-card ${!p.isOnline ? 'offline' : ''} ${v.myVote === p.accountId ? 'selected' : ''}`;
+        div.innerHTML = `
+            <div style="display:flex; align-items:center; gap:10px;">
+                <span style="width:32px; height:32px; display:inline-block;">${renderAvatarHTML(p.avatar)}</span>
+                <strong>${escapeHtml(p.name)}${p.accountId === myAccountId ? ' (You)' : ''}</strong>
+                ${statusPill(p, 'OFFLINE')}
+            </div>
+            <div style="font-size:0.8rem; color:var(--accent-gold);">Accuse 🎯</div>`;
+        div.onclick = () => castVote(p.accountId);
+        list.appendChild(div);
+    });
+
+    const status = $('voting-status');
+    if (status) {
+        const voted = v.myVote ? viewPlayers.find(p => p.accountId === v.myVote) : null;
+        status.innerText = voted
+            ? `You voted for: ${voted.name} (${v.votedCount}/${v.total} votes cast)`
+            : `Select a player to cast your vote! (${v.votedCount}/${v.total} voted)`;
+    }
+    const hostCtl = $('host-voting-controls');
+    if (hostCtl) hostCtl.style.display = isHost ? 'block' : 'none';
+    showScreen('screen-voting');
+}
+
+function castVote(targetAccountId) {
+    if (ui.phase !== 'VOTING') return;
+    if (ui.voting && ui.voting.myVote) return;      // one vote each
+
+    if (isHost) {
+        G.votes[myAccountId] = targetAccountId;
+        syncAll();
+        return;
+    }
+    if (!safeSend(myConnection, { type: 'VOTE', target: targetAccountId })) {
+        const status = $('voting-status');
+        if (status) status.innerText = "Vote failed to send - reconnecting, then try again.";
+        return;
+    }
+    // Optimistic highlight; the host's next snapshot is the source of truth.
+    ui.voting = Object.assign({}, ui.voting || { votedCount: 0, total: viewPlayers.length }, { myVote: targetAccountId });
+    renderVotingScreen();
+}
+
+// ---- spy guess -------------------------------------------------------
+function openSpyGuessModal() {
+    if (ui.role !== "SPY" || ui.phase !== 'GAME' || ui.spyGuessSent || !ui.roleVisible) return;
+    ui.pendingGuess = '';
+    renderSpyGuessList();
+    openModal('spy-guess-modal');
+}
+
+function renderSpyGuessList() {
+    const list = $('spy-guess-list');
+    if (!list) return;
+    list.innerHTML = '';
+    ui.deck.slice().sort().forEach(item => {
+        const div = document.createElement('div');
+        div.className = 'hero-item' + (item === ui.pendingGuess ? ' selected' : '');
+        div.innerText = item;
+        div.onclick = () => { ui.pendingGuess = item; renderSpyGuessList(); };
+        list.appendChild(div);
+    });
+    const label = $('spy-guess-selected');
+    if (label) label.innerText = ui.pendingGuess ? `Your guess: ${ui.pendingGuess}` : 'Tap a target above to select it';
+    const btn = $('spy-guess-confirm-btn');
+    if (btn) btn.disabled = !ui.pendingGuess;
+}
+
+function confirmSpyGuess() {
+    if (!ui.pendingGuess || ui.spyGuessSent || ui.phase !== 'GAME' || ui.role !== "SPY") return;
+    const guess = ui.pendingGuess;
+
+    if (isHost) {
+        closeModal('spy-guess-modal');
+        hostResolveSpyGuess(myAccountId, guess);
+        return;
+    }
+    if (!safeSend(myConnection, { type: 'SPY_GUESS', guess })) {
+        alert("Couldn't send your guess - check your connection and try again.");
+        return;
+    }
+    ui.spyGuessSent = true;
+    closeModal('spy-guess-modal');
+    refreshGameControls();
+    // If the host never acted on it (e.g. round already ended), let the Spy try again.
+    setTimeout(() => {
+        if (ui.phase === 'GAME' && ui.spyGuessSent) { ui.spyGuessSent = false; refreshGameControls(); }
+    }, 6000);
+}
+
+// ---- reveal ----------------------------------------------------------
+function setupRevealScreen(data) {
+    if (!data) return;
+    const winnerElem = $('reveal-winner');
+    if (winnerElem) {
+        if (data.winner === "INNOCENTS") { winnerElem.innerText = "🏆 INNOCENTS WIN!"; winnerElem.style.color = "var(--accent-green)"; }
+        else if (data.winner === "SPIES") { winnerElem.innerText = "🕵️ SPIES WIN!"; winnerElem.style.color = "var(--accent-red)"; }
+        else if (data.winner === "JESTER") { winnerElem.innerText = "🃏 JESTER WINS!"; winnerElem.style.color = "var(--accent-purple)"; }
+    }
+    $('reveal-voted-out').innerText = data.votedOutName || "Nobody";
+    $('reveal-target').innerText = data.secretTarget;
+    $('reveal-spies').innerText = (data.spies || []).join(", ");
+
+    const impTitle = $('reveal-impostor-title'), impVal = $('reveal-impostor');
+    if (impTitle && impVal) {
+        const show = !!data.jester;
+        impTitle.style.display = show ? 'block' : 'none';
+        impVal.style.display = show ? 'block' : 'none';
+        if (show) impVal.innerText = data.jester;
+    }
+
+    $('host-return-btn').style.display = isHost ? 'block' : 'none';
+    $('client-return-msg').style.display = isHost ? 'none' : 'block';
+
+    const role = ui.role;
+    const didWin = (data.winner === "INNOCENTS" && role !== "SPY" && role !== "JESTER")
+        || (data.winner === "SPIES" && role === "SPY")
+        || (data.winner === "JESTER" && role === "JESTER");
+
+    // Count each finished round once, even if we reconnect and get the REVEAL snapshot again.
+    let alreadyRecorded = false;
+    try { alreadyRecorded = localStorage.getItem(LAST_RECORDED_KEY) === ui.gameId; } catch (e) { }
+    if (!alreadyRecorded) {
+        recordGameEnd(role, didWin);
+        try { localStorage.setItem(LAST_RECORDED_KEY, ui.gameId); } catch (e) { }
+    } else if ($('xp-gain-notice')) {
+        $('xp-gain-notice').innerText = "Round result already counted.";
+    }
+    showScreen('screen-reveal');
+}
+
+// ---- modal helpers ---------------------------------------------------
+function openModal(modalId, heroName) {
+    if (heroName) {
+        const t = $('modal-hero-title'), f = $('modal-hero-facts');
+        if (t) t.innerText = heroName;
+        if (f) f.innerText = getFacts(heroName);
+    }
+    const modal = $(modalId);
+    if (modal) modal.style.display = 'flex';
+}
+
+function closeModal(modalId) {
+    const modal = $(modalId);
+    if (modal) modal.style.display = 'none';
+}
+
+// ---- boot ------------------------------------------------------------
+document.addEventListener('DOMContentLoaded', () => {
+    initAccount();
+    scanAndSyncPresets();
+    setupCropCanvasEvents();
+    setInterval(uiTick, 250);
+    document.addEventListener('visibilitychange', onAppResumed);
+    window.addEventListener('online', onAppResumed);
+    window.addEventListener('focus', onAppResumed);
+});
+
 
 // --- PRESET UI ACTIONS ---
 
@@ -910,994 +2027,3 @@ function updateStatus(text) {
     const statusElem = document.getElementById('net-status');
     if (statusElem) statusElem.innerText = "Status: " + text;
 }
-
-// --- NETWORK & ROOM CREATION SETUP ---
-
-function startHostActiveCheck() {
-    if (hostPeerCheckInterval) clearInterval(hostPeerCheckInterval);
-    hostPeerCheckInterval = setInterval(() => {
-        if (!isHost) return;
-        let listChanged = false;
-
-        Object.keys(hostConnections).forEach(peerId => {
-            const conn = hostConnections[peerId];
-            if (!conn || !conn.open) {
-                delete hostConnections[peerId];
-                const player = playerList.find(p => p.id === peerId);
-                if (player && player.isOnline) {
-                    player.isOnline = false;
-                    listChanged = true;
-                }
-            }
-        });
-
-        if (listChanged) {
-            if (gamePhase === 'LOBBY') broadcastLobbyState();
-            else broadcastPlayerStatusUpdate();
-        }
-    }, 1000);
-}
-
-// Room creation triggers folder scan and localstorage sync
-async function createRoom() {
-    if (isConnecting) return;
-
-    const nameInput = document.getElementById('player-name');
-    if (nameInput) updateAccountName(nameInput.value);
-
-    // Dynamic scan upon room creation
-    await scanAndSyncPresets();
-
-    initHostPeer(generateRoomCode(), false);
-}
-
-// Re-establish a host peer on the SAME room code (used after a host refresh/reload).
-// Any players who are still connected/waiting can rejoin with the original code.
-function resumeHostRoom(code) {
-    if (isConnecting || !code) return;
-    initHostPeer(code, true);
-}
-
-// Shared host-peer bootstrap for both fresh rooms and resumed rooms.
-function initHostPeer(code, isResume) {
-    roomCode = code;
-    myPeerId = "spyfall-dota-" + roomCode;
-    isHost = true;
-    gamePhase = 'LOBBY';
-    isConnecting = true;
-    hostPeerHasOpened = false;
-    hostConnections = {};
-    playerList = [];
-
-    sessionStorage.setItem('spyfall_active_room', roomCode);
-    sessionStorage.setItem('spyfall_active_role', 'host');
-
-    stopHeartbeat();
-    if (myPeer) {
-        try { myPeer.destroy(); } catch (e) { }
-        myPeer = null;
-    }
-
-    updateStatus(isResume ? "Resuming host session..." : "Initializing host peer...");
-    myPeer = new Peer(myPeerId);
-
-    myPeer.on('open', (id) => {
-        hostPeerHasOpened = true;
-        isConnecting = false;
-        updateStatus(isResume ? "Room resumed. Waiting for players to rejoin..." : "Connected as Host.");
-        playerList = [{
-            id: myPeerId,
-            accountId: userAccount.id,
-            name: userAccount.username,
-            avatar: userAccount.avatar,
-            level: userAccount.level,
-            isHost: true,
-            isOnline: true
-        }];
-        setupLobbyUI();
-        startHostActiveCheck();
-        startHeartbeat();
-    });
-
-    myPeer.on('connection', (conn) => {
-        conn.on('open', () => {
-            conn.on('data', (data) => handleHostMessage(conn, data));
-        });
-        conn.on('close', () => {
-            delete hostConnections[conn.peer];
-            const p = playerList.find(pl => pl.id === conn.peer);
-            if (p) p.isOnline = false;
-
-            if (gamePhase === 'LOBBY') broadcastLobbyState();
-            else broadcastPlayerStatusUpdate();
-        });
-    });
-
-    // IMPORTANT: a transient network/signaling error must NOT nuke an already-running room
-    // (that used to disconnect every connected player just because one hiccup occurred).
-    // We only ever recreate the room automatically before it has successfully opened.
-    myPeer.on('error', (err) => {
-        isConnecting = false;
-
-        if (!hostPeerHasOpened) {
-            if (err.type === 'unavailable-id') {
-                if (isResume) {
-                    alert("This room code isn't free to resume yet (it may still be closing on the server). Wait a few seconds and try again, or host a new game.");
-                    updateStatus("Disconnected.");
-                } else {
-                    // Fresh room creation collided with an existing code - just try another one.
-                    createRoom();
-                }
-            } else {
-                alert("Could not start the room (" + err.type + "). Please try again.");
-                updateStatus("Disconnected.");
-            }
-            return;
-        }
-
-        console.warn("Host peer error after room was active (room kept alive):", err.type, err);
-        updateStatus("Connection hiccup (" + err.type + ") - room still active.");
-    });
-}
-
-function joinRoom() {
-    if (isConnecting) return;
-    const nameInput = document.getElementById('player-name');
-    if (nameInput) updateAccountName(nameInput.value);
-
-    const codeInput = document.getElementById('join-code-input').value.trim().toUpperCase();
-    if (codeInput.length < 4) { alert("Please enter a valid 4-character Room Code!"); return; }
-
-    isConnecting = true;
-    const joinBtn = document.getElementById('join-btn');
-    if (joinBtn) joinBtn.disabled = true;
-
-    stopHeartbeat();
-    if (myPeer) {
-        try { myPeer.destroy(); } catch (e) { }
-        myPeer = null;
-    }
-
-    roomCode = codeInput;
-    sessionStorage.setItem('spyfall_active_room', roomCode);
-    sessionStorage.setItem('spyfall_active_role', 'client');
-    isHost = false;
-    myConnection = null;
-    const hostPeerId = "spyfall-dota-" + roomCode;
-
-    updateStatus("Connecting to host...");
-    myPeer = new Peer();
-
-    myPeer.on('open', (id) => {
-        myPeerId = id;
-        const conn = myPeer.connect(hostPeerId);
-
-        conn.on('open', () => {
-            isConnecting = false;
-            myConnection = conn;
-            if (joinBtn) joinBtn.disabled = false;
-            updateStatus("Connected to room " + roomCode);
-            startHeartbeat();
-            safeSend(conn, {
-                type: 'JOIN',
-                accountId: userAccount.id,
-                name: userAccount.username,
-                avatar: userAccount.avatar,
-                level: userAccount.level
-            });
-        });
-
-        conn.on('data', (data) => handleClientMessage(data));
-
-        conn.on('close', () => {
-            isConnecting = false;
-            if (myConnection === conn) myConnection = null;
-            if (joinBtn) joinBtn.disabled = false;
-            stopHeartbeat();
-            alert("Disconnected from host room.");
-            updateStatus("Disconnected.");
-        });
-
-        conn.on('error', (err) => {
-            console.warn("Client connection error:", err);
-        });
-    });
-
-    myPeer.on('error', (err) => {
-        isConnecting = false;
-        if (joinBtn) joinBtn.disabled = false;
-        alert("Could not connect to room code " + roomCode + ". Check the code and try again.");
-        updateStatus("Disconnected.");
-    });
-}
-
-function handleHostMessage(conn, data) {
-    // Any message at all proves the channel is alive - refresh heartbeat state.
-    connLastPong[conn.peer] = Date.now();
-
-    if (data.type === 'PONG') {
-        return;
-    } else if (data.type === 'PING') {
-        safeSend(conn, { type: 'PONG', t: Date.now() });
-        return;
-    }
-
-    if (data.type === 'JOIN') {
-        const accId = typeof data.accountId === 'string' ? data.accountId.slice(0, 64) : conn.peer;
-        const safeIncomingName = sanitizeName(data.name, "Player");
-        let existingPlayer = playerList.find(p => p.accountId === accId);
-
-        // Validate received avatar: Must be standard string/emoji OR valid Base64 image under 3 MB
-        let validAvatar = "⚔️";
-        if (data.avatar && typeof data.avatar === 'string') {
-            if (data.avatar.startsWith('data:image/')) {
-                // Check if it's an allowed image extension/MIME type
-                const isImageExtension = /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,/i.test(data.avatar);
-
-                // Avatars are now cropped/downscaled client-side before ever being sent, so a
-                // legitimate avatar should be well under this. This keeps a hard ceiling so a
-                // modified/malicious client can't flood the mesh with huge payloads that would
-                // stall the data channel for every other peer.
-                const MAX_AVATAR_BASE64_CHARS = 400000; // ~300 KB raw
-                const isUnderSizeCap = data.avatar.length <= MAX_AVATAR_BASE64_CHARS;
-
-                if (isImageExtension && isUnderSizeCap) {
-                    validAvatar = data.avatar;
-                } else {
-                    console.warn(`Rejected profile picture from peer ${conn.peer}: Invalid image format or size too large.`);
-                }
-            } else {
-                // Standard emoji or short text avatar
-                validAvatar = data.avatar;
-            }
-        }
-
-        if (existingPlayer) {
-            if (existingPlayer.id && hostConnections[existingPlayer.id] && existingPlayer.id !== conn.peer) {
-                try { hostConnections[existingPlayer.id].close(); } catch (e) {}
-                delete hostConnections[existingPlayer.id];
-            }
-            existingPlayer.id = conn.peer;
-            existingPlayer.name = safeIncomingName;
-            existingPlayer.avatar = validAvatar;
-            existingPlayer.level = Number.isFinite(data.level) ? data.level : 1;
-            existingPlayer.isOnline = true;
-            hostConnections[conn.peer] = conn;
-
-            if (gamePhase === 'LOBBY') {
-                broadcastLobbyState();
-            } else if (gamePhase === 'GAME') {
-                const reconnectRole = gameRoles[accId];
-                safeSend(conn, {
-                    type: 'GAME_START',
-                    role: reconnectRole,
-                    secretTarget: reconnectRole === "SPY" ? null : chosenSecret,
-                    starter: currentStarterName,
-                    timeRemaining: timeRemaining,
-                    deck: currentDeck,
-                    factsMap: activeFactsMap,
-                    roster: playerList
-                });
-                broadcastPlayerStatusUpdate();
-            } else if (gamePhase === 'VOTING') {
-                safeSend(conn, {
-                    type: 'START_VOTING',
-                    players: playerList.map(p => ({ accountId: p.accountId, name: p.name, avatar: p.avatar, isOnline: p.isOnline }))
-                });
-                broadcastPlayerStatusUpdate();
-            } else if (gamePhase === 'REVEAL') {
-                if (lastGameOverPayload) safeSend(conn, lastGameOverPayload);
-            }
-        } else {
-            if (gamePhase !== 'LOBBY') {
-                safeSend(conn, { type: 'KICKED', reason: 'Match already in progress.' });
-                setTimeout(() => { try { conn.close(); } catch (e) { } }, 150);
-                return;
-            }
-            hostConnections[conn.peer] = conn;
-            playerList.push({ 
-                id: conn.peer, 
-                accountId: accId,
-                name: safeIncomingName, 
-                avatar: validAvatar, 
-                level: Number.isFinite(data.level) ? data.level : 1, 
-                isHost: false,
-                isOnline: true
-            });
-            broadcastLobbyState();
-        }
-    } else if (data.type === 'SUBMIT_VOTE') {
-        // Anti-cheat: only accept votes from known players in the voting phase,
-        // for a target that's actually in the room (reject spoofed IDs).
-        if (gamePhase !== 'VOTING') return;
-        const voter = playerList.find(p => p.accountId === data.voterAccountId && p.id === conn.peer);
-        const targetValid = playerList.some(p => p.accountId === data.targetAccountId);
-        if (!voter || !targetValid) {
-            console.warn("Rejected invalid/spoofed vote from peer", conn.peer);
-            return;
-        }
-        votes[data.voterAccountId] = data.targetAccountId;
-        broadcastVoteProgress();
-    } else if (data.type === 'SPY_GUESS') {
-        if (gamePhase !== 'GAME' || spyGuessResolved) return;
-        const guesser = playerList.find(p => p.accountId === data.accountId && p.id === conn.peer);
-        if (!guesser || gameRoles[data.accountId] !== "SPY") {
-            console.warn("Rejected spy guess from non-spy or spoofed peer", conn.peer);
-            return;
-        }
-        hostResolveSpyGuess(data.accountId, typeof data.guess === 'string' ? data.guess : '');
-    }
-}
-
-function kickPlayer(accountId) {
-    if (!isHost) return;
-    const player = playerList.find(p => p.accountId === accountId);
-    if (player) {
-        const conn = hostConnections[player.id];
-        if (conn) {
-            safeSend(conn, { type: 'KICKED' });
-            setTimeout(() => { try { conn.close(); } catch (e) { } }, 100);
-            delete hostConnections[player.id];
-        }
-        playerList = playerList.filter(p => p.accountId !== accountId);
-        if (gamePhase === 'LOBBY') broadcastLobbyState();
-        else broadcastPlayerStatusUpdate();
-    }
-}
-
-function broadcastLobbyState() {
-    const payload = { type: 'LOBBY_STATE', players: playerList };
-    safeBroadcast(hostConnections, payload);
-    renderLobbyList();
-}
-
-function broadcastPlayerStatusUpdate() {
-    const payload = { type: 'ROSTER_UPDATE', players: playerList };
-    safeBroadcast(hostConnections, payload);
-    renderRosterStatus();
-}
-
-function renderLobbyList() {
-    const listElem = document.getElementById('lobby-player-list');
-    if (!listElem) return;
-    listElem.innerHTML = '';
-    playerList.forEach(p => {
-        const div = document.createElement('div');
-        div.className = `player-item ${!p.isOnline ? 'offline' : ''}`;
-
-        const safeAccId = escapeHtml(String(p.accountId)).replace(/'/g, "&#39;");
-        const kickBtnHtml = (isHost && !p.isHost)
-            ? `<button class="sm-btn" style="background:var(--accent-red); color:#fff; margin-left:8px;" onclick="kickPlayer('${safeAccId}')">Remove</button>`
-            : '';
-
-        const statusPill = p.isOnline
-            ? '<span class="status-pill online">ONLINE</span>'
-            : '<span class="status-pill offline">DISCONNECTED</span>';
-
-        div.innerHTML = `
-            <div class="player-item-left">
-                <span class="account-avatar" style="width:28px; height:28px; border:none;">${renderAvatarHTML(p.avatar)}</span>
-                <strong>${escapeHtml(p.name)}</strong>
-                <span class="account-level-badge">Lvl ${Number.isFinite(p.level) ? p.level : 1}</span>
-                ${statusPill}
-            </div>
-            <div>
-                ${p.isHost ? '<span class="player-host-badge">[HOST]</span>' : ''}
-                ${kickBtnHtml}
-            </div>
-        `;
-        listElem.appendChild(div);
-    });
-}
-
-function setupLobbyUI() {
-    gamePhase = 'LOBBY';
-    populatePresetDropdown();
-    const roomCodeElem = document.getElementById('lobby-room-code');
-    if (roomCodeElem) roomCodeElem.innerText = roomCode;
-
-    const hostSettings = document.getElementById('host-settings');
-    if (hostSettings) hostSettings.style.display = isHost ? 'block' : 'none';
-
-    const clientWaiting = document.getElementById('client-waiting');
-    if (clientWaiting) clientWaiting.style.display = isHost ? 'none' : 'block';
-
-    renderLobbyList();
-    showScreen('screen-lobby');
-}
-
-// --- HOST GAME START LOGIC ---
-function hostStartGame() {
-    const spyCount = Math.min(3, Math.max(1, parseInt(document.getElementById('spy-count').value) || 1));
-    const enableJester = document.getElementById('enable-impostor').checked;
-    const timeMins = Math.min(15, Math.max(1, parseInt(document.getElementById('round-time').value) || 6));
-
-    let requiredSpecialRoles = spyCount + (enableJester ? 1 : 0);
-    if (requiredSpecialRoles >= playerList.length) {
-        alert("Spies + Impostor must be fewer than total players in the room!");
-        return;
-    }
-
-    const selectedPresetKey = document.getElementById('preset-select').value;
-    const presets = getStoredPresets();
-    const selectedPreset = presets[selectedPresetKey];
-
-    if (!selectedPreset || !selectedPreset.items || selectedPreset.items.length < 3) {
-        alert("Invalid preset! Please select a valid word pack with at least 3 items.");
-        return;
-    }
-
-    currentDeck = [...selectedPreset.items];
-    activeFactsMap = selectedPreset.facts || {};
-
-    chosenSecret = currentDeck[Math.floor(Math.random() * currentDeck.length)];
-    gamePhase = 'GAME';
-
-    gameRoles = {};
-    const accIds = playerList.map(p => p.accountId);
-    accIds.forEach(id => gameRoles[id] = chosenSecret);
-
-    let assignedSpies = 0;
-    while (assignedSpies < spyCount) {
-        let rIdx = Math.floor(Math.random() * accIds.length);
-        let targetId = accIds[rIdx];
-        if (gameRoles[targetId] === chosenSecret) {
-            gameRoles[targetId] = "SPY";
-            assignedSpies++;
-        }
-    }
-
-    if (enableJester) {
-        let assignedJester = false;
-        while (!assignedJester) {
-            let rIdx = Math.floor(Math.random() * accIds.length);
-            let targetId = accIds[rIdx];
-            if (gameRoles[targetId] === chosenSecret) {
-                gameRoles[targetId] = "JESTER";
-                assignedJester = true;
-            }
-        }
-    }
-
-    currentStarterName = playerList[Math.floor(Math.random() * playerList.length)].name;
-    timeRemaining = timeMins * 60;
-    spyGuessResolved = false;
-
-    playerList.forEach(p => {
-        const role = gameRoles[p.accountId];
-        const payload = {
-            type: 'GAME_START',
-            role: role,
-            // The Spy must never receive the secret target over the wire - otherwise
-            // opening devtools/network inspector would trivially reveal it.
-            secretTarget: role === "SPY" ? null : chosenSecret,
-            starter: currentStarterName,
-            timeRemaining: timeRemaining,
-            deck: currentDeck,
-            factsMap: activeFactsMap,
-            roster: playerList
-        };
-
-        if (p.isHost) {
-            setupClientGameScreen(payload);
-        } else {
-            safeSend(hostConnections[p.id], payload);
-        }
-    });
-
-    if (timerInterval) clearInterval(timerInterval);
-    isPaused = false;
-    timerInterval = setInterval(() => {
-        if (!isPaused) {
-            timeRemaining--;
-            broadcastTimerSync();
-            if (timeRemaining <= 0) {
-                clearInterval(timerInterval);
-                hostStartVoting();
-            }
-        }
-    }, 1000);
-}
-
-function broadcastTimerSync() {
-    const payload = { type: 'TIMER_SYNC', timeRemaining: timeRemaining, isPaused: isPaused };
-    safeBroadcast(hostConnections, payload);
-    updateTimerDisplay(timeRemaining);
-}
-
-function hostToggleTimer() {
-    isPaused = !isPaused;
-    const btn = document.getElementById('pause-btn');
-    if (btn) btn.innerText = isPaused ? "Resume" : "Pause";
-    broadcastTimerSync();
-}
-
-// --- VOTING PHASE LOGIC ---
-function hostStartVoting() {
-    if (timerInterval) clearInterval(timerInterval);
-    gamePhase = 'VOTING';
-    votes = {};
-    hasVoted = false;
-
-    const payload = {
-        type: 'START_VOTING',
-        players: playerList.map(p => ({ accountId: p.accountId, name: p.name, avatar: p.avatar, isOnline: p.isOnline }))
-    };
-
-    playerList.forEach(p => {
-        if (p.isHost) {
-            setupVotingScreen(payload);
-        } else {
-            safeSend(hostConnections[p.id], payload);
-        }
-    });
-}
-
-function setupVotingScreen(data) {
-    gamePhase = 'VOTING';
-    hasVoted = false;
-    const listElem = document.getElementById('voting-target-list');
-    if (!listElem) return;
-    listElem.innerHTML = '';
-
-    data.players.forEach(p => {
-        const div = document.createElement('div');
-        div.className = `vote-card ${!p.isOnline ? 'offline' : ''}`;
-        div.id = 'vote-card-' + p.accountId;
-
-        const statusPill = p.isOnline
-            ? '<span class="status-pill online">ONLINE</span>'
-            : '<span class="status-pill offline">OFFLINE</span>';
-
-        div.innerHTML = `
-            <div style="display:flex; align-items:center; gap:10px;">
-                <span style="width:32px; height:32px; display:inline-block;">${renderAvatarHTML(p.avatar)}</span>
-                <strong>${escapeHtml(p.name)} ${p.accountId === userAccount.id ? ' (You)' : ''}</strong>
-                ${statusPill}
-            </div>
-            <div style="font-size:0.8rem; color:var(--accent-gold);">Accuse 🎯</div>
-        `;
-        div.onclick = () => castVote(p.accountId, div);
-        listElem.appendChild(div);
-    });
-
-    const votingStatus = document.getElementById('voting-status');
-    if (votingStatus) votingStatus.innerText = "Select a player to cast your vote!";
-
-    const hostVotingControls = document.getElementById('host-voting-controls');
-    if (hostVotingControls) hostVotingControls.style.display = isHost ? 'block' : 'none';
-
-    showScreen('screen-voting');
-}
-
-function castVote(targetAccountId, cardElem) {
-    if (hasVoted) return;
-    hasVoted = true;
-
-    document.querySelectorAll('.vote-card').forEach(c => c.classList.remove('selected'));
-    cardElem.classList.add('selected');
-
-    const targetPlayer = playerList.find(p => p.accountId === targetAccountId);
-    const votingStatus = document.getElementById('voting-status');
-    if (votingStatus) {
-        votingStatus.innerText = `You voted for: ${targetPlayer ? targetPlayer.name : 'Unknown'}`;
-    }
-
-    if (isHost) {
-        votes[userAccount.id] = targetAccountId;
-        broadcastVoteProgress();
-    } else if (!safeSend(myConnection, { type: 'SUBMIT_VOTE', voterAccountId: userAccount.id, targetAccountId: targetAccountId })) {
-        // Vote couldn't be delivered - don't silently pretend it was cast.
-        hasVoted = false;
-        document.querySelectorAll('.vote-card').forEach(c => c.classList.remove('selected'));
-        if (votingStatus) votingStatus.innerText = "Vote failed to send - check your connection and try again.";
-    }
-}
-
-function broadcastVoteProgress() {
-    const count = Object.keys(votes).length;
-    const total = playerList.length;
-    const payload = { type: 'VOTE_SYNC', votedCount: count, totalPlayers: total };
-
-    safeBroadcast(hostConnections, payload);
-    updateVoteProgressUI(count, total);
-}
-
-function updateVoteProgressUI(count, total) {
-    if (hasVoted) {
-        const votingStatus = document.getElementById('voting-status');
-        if (votingStatus) votingStatus.innerText = `Vote recorded! (${count}/${total} votes cast)`;
-    }
-}
-
-function hostConcludeVoting() {
-    gamePhase = 'REVEAL';
-    const tally = {};
-    Object.values(votes).forEach(targetAccountId => {
-        if (targetAccountId) tally[targetAccountId] = (tally[targetAccountId] || 0) + 1;
-    });
-
-    let maxVotes = 0;
-    let votedOutId = null;
-    let isTie = false;
-
-    Object.keys(tally).forEach(targetAccountId => {
-        if (tally[targetAccountId] > maxVotes) {
-            maxVotes = tally[targetAccountId];
-            votedOutId = targetAccountId;
-            isTie = false;
-        } else if (tally[targetAccountId] === maxVotes) {
-            isTie = true;
-        }
-    });
-
-    let winner = "SPIES";
-    let votedOutPlayer = null;
-
-    if (!isTie && votedOutId) {
-        votedOutPlayer = playerList.find(p => p.accountId === votedOutId);
-        const votedRole = gameRoles[votedOutId];
-
-        // Jester's whole plan is to get voted out - so that outcome takes priority.
-        if (votedRole === "JESTER") {
-            winner = "JESTER";
-        } else if (votedRole === "SPY") {
-            winner = "INNOCENTS";
-        } else {
-            winner = "SPIES";
-        }
-    }
-
-    const spyNames = [];
-    let jesterName = null;
-
-    playerList.forEach(p => {
-        if (gameRoles[p.accountId] === "SPY") spyNames.push(p.name);
-        if (gameRoles[p.accountId] === "JESTER") jesterName = p.name;
-    });
-
-    lastGameOverPayload = {
-        type: 'GAME_OVER',
-        secretTarget: chosenSecret,
-        spies: spyNames,
-        jester: jesterName,
-        winner: winner,
-        votedOutName: votedOutPlayer ? votedOutPlayer.name : (isTie ? "Nobody (Tie Vote)" : "Nobody")
-    };
-
-    playerList.forEach(p => {
-        if (p.isHost) {
-            setupRevealScreen(lastGameOverPayload);
-        } else {
-            safeSend(hostConnections[p.id], lastGameOverPayload);
-        }
-    });
-}
-
-function hostEndGame() {
-    if (timerInterval) clearInterval(timerInterval);
-    gamePhase = 'REVEAL';
-
-    const spyNames = [];
-    let jesterName = null;
-
-    playerList.forEach(p => {
-        if (gameRoles[p.accountId] === "SPY") spyNames.push(p.name);
-        if (gameRoles[p.accountId] === "JESTER") jesterName = p.name;
-    });
-
-    lastGameOverPayload = {
-        type: 'GAME_OVER',
-        secretTarget: chosenSecret,
-        spies: spyNames,
-        jester: jesterName,
-        winner: "SPIES",
-        votedOutName: "None (Ended by Host)"
-    };
-
-    safeBroadcast(hostConnections, lastGameOverPayload);
-    setupRevealScreen(lastGameOverPayload);
-}
-
-function hostReturnToLobby() {
-    gamePhase = 'LOBBY';
-    const payload = { type: 'RETURN_LOBBY' };
-    safeBroadcast(hostConnections, payload);
-    setupLobbyUI();
-}
-
-// --- CLIENT RECEIVE LOGIC ---
-function handleClientMessage(data) {
-    // Any message at all proves the host connection is alive.
-    lastHostContactAt = Date.now();
-
-    if (data.type === 'PONG') {
-        return;
-    } else if (data.type === 'PING') {
-        safeSend(myConnection, { type: 'PONG', t: Date.now() });
-        return;
-    }
-
-    if (data.type === 'KICKED') {
-        alert(data.reason || "You have been removed from the room.");
-        sessionStorage.removeItem('spyfall_active_room');
-        sessionStorage.removeItem('spyfall_active_role');
-        location.reload();
-        return;
-    } else if (data.type === 'LOBBY_STATE') {
-        playerList = data.players;
-        renderLobbyList();
-        showScreen('screen-lobby');
-    } else if (data.type === 'ROSTER_UPDATE') {
-        playerList = data.players;
-        if (gamePhase === 'GAME') renderRosterStatus();
-    } else if (data.type === 'GAME_START') {
-        if (data.roster) playerList = data.roster;
-        setupClientGameScreen(data);
-    } else if (data.type === 'TIMER_SYNC') {
-        timeRemaining = data.timeRemaining;
-        isPaused = data.isPaused;
-        updateTimerDisplay(timeRemaining);
-    } else if (data.type === 'START_VOTING') {
-        setupVotingScreen(data);
-    } else if (data.type === 'VOTE_SYNC') {
-        updateVoteProgressUI(data.votedCount, data.totalPlayers);
-    } else if (data.type === 'GAME_OVER') {
-        setupRevealScreen(data);
-    } else if (data.type === 'RETURN_LOBBY') {
-        setupLobbyUI();
-    }
-}
-
-// --- GAME UI RENDERING ---
-function setupClientGameScreen(data) {
-    gamePhase = 'GAME';
-    myAssignedRole = data.role;
-    activeFactsMap = data.factsMap || {};
-
-    const firstPlayerElem = document.getElementById('first-player');
-    if (firstPlayerElem) firstPlayerElem.innerText = data.starter;
-
-    const hostControls = document.getElementById('host-game-controls');
-    if (hostControls) hostControls.style.display = isHost ? 'flex' : 'none';
-
-    roleCardVisible = false;
-    document.getElementById('role-card-hidden').style.display = 'block';
-    document.getElementById('role-card-content').style.display = 'none';
-    document.getElementById('toggle-role-btn').innerText = "👁️ Reveal My Secret Role";
-
-    const roleTitleElem = document.getElementById('role-title');
-    const roleValElem = document.getElementById('role-value');
-    const factsBox = document.getElementById('facts-box');
-    const factsContent = document.getElementById('facts-content');
-
-    factsBox.className = "facts-box";
-
-    if (data.role === "SPY") {
-        roleTitleElem.innerText = "YOU ARE THE";
-        roleValElem.innerText = "SPY!";
-        roleValElem.className = "role-value spy";
-        factsContent.innerHTML = "You don't know the secret hero or location! Ask clever questions and listen carefully to stay hidden.";
-    } else if (data.role === "JESTER") {
-        roleTitleElem.innerText = "YOU ARE THE";
-        roleValElem.innerText = "JESTER!";
-        roleValElem.className = "role-value jester";
-        factsBox.className = "facts-box jester-rules";
-        factsContent.innerHTML = `<strong>Target:</strong> ${escapeHtml(data.secretTarget)}<br>
-        <strong>Facts:</strong> ${escapeHtml(getFacts(data.secretTarget))}<br><br>
-        🃏 <strong>OBJECTIVE:</strong> You know the hero! You don't want to blend in - you want to get voted out. Act suspicious and bait the group into voting for YOU. If they vote you out, YOU WIN!`;
-    } else {
-        roleTitleElem.innerText = "SECRET TARGET:";
-        roleValElem.innerText = data.role;
-        roleValElem.className = "role-value";
-        factsContent.innerHTML = `<strong>Traits/Facts:</strong> ${escapeHtml(getFacts(data.role))}`;
-    }
-
-    // Spy-only: guess the secret target to end the round immediately.
-    const spyGuessBtn = document.getElementById('spy-guess-btn');
-    if (spyGuessBtn) spyGuessBtn.style.display = (data.role === "SPY") ? 'block' : 'none';
-    spyGuessResolved = false;
-
-    renderRosterStatus();
-
-    const grid = document.getElementById('deck-grid');
-    if (grid) {
-        grid.innerHTML = '';
-        data.deck.slice().sort().forEach(item => {
-            const div = document.createElement('div');
-            div.className = 'hero-item';
-            div.innerText = item;
-            div.onclick = () => openModal('fact-modal', item);
-            grid.appendChild(div);
-        });
-    }
-
-    updateTimerDisplay(data.timeRemaining);
-    showScreen('screen-game');
-}
-
-function renderRosterStatus() {
-    const container = document.getElementById('game-roster-status');
-    if (!container) return;
-    container.innerHTML = '';
-
-    playerList.forEach(p => {
-        const div = document.createElement('div');
-        div.className = `player-item ${!p.isOnline ? 'offline' : ''}`;
-        const statusPill = p.isOnline
-            ? '<span class="status-pill online">ONLINE</span>'
-            : '<span class="status-pill offline">RECONNECTING...</span>';
-
-        div.innerHTML = `
-            <div class="player-item-left">
-                <span style="width:24px; height:24px; display:inline-block;">${renderAvatarHTML(p.avatar)}</span>
-                <strong>${escapeHtml(p.name)}</strong>
-            </div>
-            <div>${statusPill}</div>
-        `;
-        container.appendChild(div);
-    });
-}
-
-// --- SPY GUESS-THE-TARGET ---
-function openSpyGuessModal() {
-    if (myAssignedRole !== "SPY" || spyGuessResolved) return;
-    const listElem = document.getElementById('spy-guess-list');
-    if (!listElem) return;
-    listElem.innerHTML = '';
-
-    currentDeck.slice().sort().forEach(item => {
-        const div = document.createElement('div');
-        div.className = 'hero-item';
-        div.style.cursor = 'pointer';
-        div.innerText = item;
-        div.onclick = () => confirmSpyGuess(item);
-        listElem.appendChild(div);
-    });
-
-    openModal('spy-guess-modal');
-}
-
-function confirmSpyGuess(guess) {
-    if (!confirm(`Lock in "${guess}" as your final guess? This ends the round immediately, win or lose.`)) return;
-    if (spyGuessResolved) return;
-
-    closeModal('spy-guess-modal');
-
-    if (isHost) {
-        hostResolveSpyGuess(userAccount.id, guess);
-    } else if (!safeSend(myConnection, { type: 'SPY_GUESS', accountId: userAccount.id, guess: guess })) {
-        alert("Couldn't send your guess - check your connection and try again.");
-    }
-}
-
-function hostResolveSpyGuess(guesserAccountId, guess) {
-    if (gamePhase !== 'GAME' || spyGuessResolved) return;
-    spyGuessResolved = true;
-    if (timerInterval) clearInterval(timerInterval);
-    gamePhase = 'REVEAL';
-
-    const correct = typeof guess === 'string' && guess.trim().toLowerCase() === String(chosenSecret).trim().toLowerCase();
-    const guesser = playerList.find(p => p.accountId === guesserAccountId);
-
-    const spyNames = [];
-    let jesterName = null;
-    playerList.forEach(p => {
-        if (gameRoles[p.accountId] === "SPY") spyNames.push(p.name);
-        if (gameRoles[p.accountId] === "JESTER") jesterName = p.name;
-    });
-
-    lastGameOverPayload = {
-        type: 'GAME_OVER',
-        secretTarget: chosenSecret,
-        spies: spyNames,
-        jester: jesterName,
-        winner: correct ? "SPIES" : "INNOCENTS",
-        votedOutName: `None - ${guesser ? guesser.name : 'The Spy'} guessed "${guess}" (${correct ? 'Correct!' : 'Wrong!'})`
-    };
-
-    playerList.forEach(p => {
-        if (p.isHost) {
-            setupRevealScreen(lastGameOverPayload);
-        } else {
-            safeSend(hostConnections[p.id], lastGameOverPayload);
-        }
-    });
-}
-
-function toggleRoleVisibility() {
-    roleCardVisible = !roleCardVisible;
-    document.getElementById('role-card-hidden').style.display = roleCardVisible ? 'none' : 'block';
-    document.getElementById('role-card-content').style.display = roleCardVisible ? 'block' : 'none';
-    document.getElementById('toggle-role-btn').innerText = roleCardVisible ? "🙈 Hide Role Card" : "👁️ Reveal My Secret Role";
-}
-
-function updateTimerDisplay(seconds) {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    const timerElem = document.getElementById('timer-display');
-    if (timerElem) {
-        timerElem.innerText = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    }
-}
-
-function setupRevealScreen(data) {
-    gamePhase = 'REVEAL';
-    const winnerElem = document.getElementById('reveal-winner');
-    if (winnerElem) {
-        if (data.winner === "INNOCENTS") {
-            winnerElem.innerText = "🏆 INNOCENTS WIN!";
-            winnerElem.style.color = "var(--accent-green)";
-        } else if (data.winner === "SPIES") {
-            winnerElem.innerText = "🕵️ SPIES WIN!";
-            winnerElem.style.color = "var(--accent-red)";
-        } else if (data.winner === "JESTER") {
-            winnerElem.innerText = "🃏 JESTER WINS!";
-            winnerElem.style.color = "var(--accent-purple)";
-        }
-    }
-
-    const votedOutElem = document.getElementById('reveal-voted-out');
-    if (votedOutElem) votedOutElem.innerText = data.votedOutName || "Nobody";
-
-    const targetElem = document.getElementById('reveal-target');
-    if (targetElem) targetElem.innerText = data.secretTarget;
-
-    const spiesElem = document.getElementById('reveal-spies');
-    if (spiesElem) spiesElem.innerText = data.spies.join(", ");
-
-    const impTitle = document.getElementById('reveal-impostor-title');
-    const impVal = document.getElementById('reveal-impostor');
-    if (impTitle && impVal) {
-        if (data.jester) {
-            impTitle.style.display = 'block';
-            impVal.style.display = 'block';
-            impVal.innerText = data.jester;
-        } else {
-            impTitle.style.display = 'none';
-            impVal.style.display = 'none';
-        }
-    }
-
-    const hostReturnBtn = document.getElementById('host-return-btn');
-    if (hostReturnBtn) hostReturnBtn.style.display = isHost ? 'block' : 'none';
-
-    const clientReturnMsg = document.getElementById('client-return-msg');
-    if (clientReturnMsg) clientReturnMsg.style.display = isHost ? 'none' : 'block';
-
-    let didWin = false;
-    if (data.winner === "INNOCENTS" && myAssignedRole !== "SPY" && myAssignedRole !== "JESTER") {
-        didWin = true;
-    } else if (data.winner === "SPIES" && myAssignedRole === "SPY") {
-        didWin = true;
-    } else if (data.winner === "JESTER" && myAssignedRole === "JESTER") {
-        didWin = true;
-    }
-
-    recordGameEnd(myAssignedRole, didWin);
-
-    showScreen('screen-reveal');
-}
-
-function openModal(modalId, heroName) {
-    if (heroName) {
-        const titleElem = document.getElementById('modal-hero-title');
-        const factsElem = document.getElementById('modal-hero-facts');
-        if (titleElem) titleElem.innerText = heroName;
-        if (factsElem) factsElem.innerText = getFacts(heroName);
-    }
-    const modal = document.getElementById(modalId);
-    if (modal) modal.style.display = 'flex';
-}
-
-function closeModal(modalId) {
-    const modal = document.getElementById(modalId);
-    if (modal) modal.style.display = 'none';
-}
-
-// --- INITIALIZATION ---
-document.addEventListener('DOMContentLoaded', () => {
-    initAccount();
-    scanAndSyncPresets();
-    setupCropCanvasEvents();
-});

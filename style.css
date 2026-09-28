@@ -674,3 +674,66 @@ textarea:focus {
 .avatar-option {
     overflow: hidden;
 }
+
+/* Connection banner (heartbeat / reconnect status) */
+.conn-banner {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 90;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #111;
+    background: var(--accent-gold);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+}
+
+.conn-banner.offline {
+    background: var(--accent-red);
+    color: #fff;
+}
+
+.conn-banner.online {
+    background: var(--accent-green);
+}
+
+.banner-btn {
+    border: 1px solid rgba(0, 0, 0, 0.4);
+    background: rgba(255, 255, 255, 0.85);
+    color: #111;
+    border-radius: 4px;
+    padding: 3px 10px;
+    font-size: 0.75rem;
+    font-weight: bold;
+    cursor: pointer;
+    margin-left: 4px;
+}
+
+/* Spy guess */
+.btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.hero-item.selected {
+    border-color: var(--accent-purple);
+    background-color: rgba(171, 71, 188, 0.3);
+}
+
+.spy-guess-selected {
+    margin: 10px 0 4px;
+    font-size: 0.9rem;
+    font-weight: bold;
+    color: var(--accent-gold);
+    text-align: center;
+}
+
+#spy-guess-btn {
+    margin-top: 12px;
+}

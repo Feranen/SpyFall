@@ -12,6 +12,15 @@
 
 <body>
 
+    <!-- CONNECTION BANNER (heartbeat / auto-reconnect status) -->
+    <div id="conn-banner" class="conn-banner" style="display:none;">
+        <span id="conn-banner-text"></span>
+        <span>
+            <button class="banner-btn" id="conn-banner-retry" style="display:none;" onclick="reconnectLastRoom()">Retry</button>
+            <button class="banner-btn" id="conn-banner-leave" onclick="leaveRoom()">Leave</button>
+        </span>
+    </div>
+
     <div class="container">
         <!-- ACCOUNT HEADER BAR -->
         <div class="account-bar" onclick="openAccountModal()">
@@ -125,14 +134,12 @@
                     <div class="facts-box" id="facts-box">
                         <div id="facts-content">...</div>
                     </div>
+                    <button class="btn btn-purple" id="spy-guess-btn" style="display:none;"
+                        onclick="openSpyGuessModal()">🎯 Guess Secret Target</button>
                 </div>
             </div>
 
             <div class="timer" id="timer-display">06:00</div>
-
-            <button class="btn btn-purple" id="spy-guess-btn" style="display:none;" onclick="openSpyGuessModal()">
-                🎯 Guess Secret Target
-            </button>
 
             <div id="host-game-controls" style="display: none; gap: 8px; margin-top: 5px;">
                 <button class="btn btn-secondary" onclick="hostToggleTimer()" id="pause-btn">Pause</button>
@@ -315,6 +322,9 @@
                 guess wrong and the round ends in an Innocent win. Choose carefully!
             </div>
             <div class="hero-grid" id="spy-guess-list" style="max-height: 260px;"></div>
+            <div id="spy-guess-selected" class="spy-guess-selected">Tap a target above to select it</div>
+            <button class="btn btn-purple" id="spy-guess-confirm-btn" onclick="confirmSpyGuess()" disabled>🔒 Lock In
+                Guess</button>
             <button class="btn btn-secondary" style="margin-top: 10px;"
                 onclick="closeModal('spy-guess-modal')">Cancel</button>
         </div>
