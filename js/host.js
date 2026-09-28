@@ -24,7 +24,7 @@ function refreshHostSelf() {
     if (!me) { me = { isHost: true }; playerList.unshift(me); }
     Object.assign(me, {
         id: myPeerId, accountId: userAccount.id, name: sanitizeName(userAccount.username, 'Host'),
-        avatar: userAccount.avatar, level: userAccount.level, isHost: true, isOnline: true, lastSeen: Date.now()
+        avatar: validateAvatar(userAccount.avatar), level: userAccount.level, isHost: true, isOnline: true, lastSeen: Date.now()
     });
 }
 

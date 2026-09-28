@@ -68,14 +68,172 @@ function timerMsNow(t) {
 
 function playerByPeer(peerId) { return playerList.find(p => p.id === peerId); }
 
-function validateAvatar(raw) {
-    if (!raw || typeof raw !== 'string') return "⚔️";
-    if (raw.startsWith('data:image/')) {
-        const okType = /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,/i.test(raw);
-        if (okType && raw.length <= 400000) return raw;   // hard cap so a bad client can't flood the mesh
-        return "⚔️";
+// =====================================================================
+// AVATAR SAFETY
+// Every peer (host AND clients) runs these checks on every avatar it is about
+// to display, no matter who sent it. Nothing from the network is trusted:
+//   1. Emoji avatars must be one of AVATAR_OPTIONS (no free text, so no markup).
+//   2. Image avatars must be a strict base64 data URL of JPEG or GIF (the only
+//      formats this app produces; SVG/PNG/WebP are NOT accepted over the wire)
+//      within the size cap.
+//   3. The decoded bytes must start with the magic number of the declared type,
+//      pass a structural check (GIFs: only the blocks our encoder writes, no
+//      comments/foreign extensions/trailing data; JPEGs: no comment segments,
+//      proper end marker) and be at most MAX_AVATAR_DIM px per side.
+//   4. The browser must actually be able to decode it (Image onload) with the
+//      same dimension limits. Until that succeeds, a default emoji is shown.
+// Results are cached per avatar string so each image is verified only once.
+// =====================================================================
+const DEFAULT_AVATAR = "⚔️";
+const AVATAR_OUT_SIZE = 512;                          // every avatar is resized to this (px, square)
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;             // largest file a user may pick (image or GIF)
+const MAX_AVATAR_BYTES = 5 * 1024 * 1024;             // largest avatar any peer will accept
+const MAX_AVATAR_CHARS = Math.ceil(MAX_AVATAR_BYTES / 3) * 4 + 64;   // same limit as a data-URL length
+const AVATAR_STORE_BUDGET = 2 * 1024 * 1024;          // what WE produce (keeps localStorage from overflowing)
+const MAX_AVATAR_DIM = AVATAR_OUT_SIZE;               // received avatars: px per side
+const AVATAR_DATA_URL_RE = /^data:image\/(jpeg|gif);base64,[A-Za-z0-9+\/]+={0,2}$/;
+const AVATAR_VERDICT_CHAR_BUDGET = 32000000;          // total characters kept in the verdict cache
+let avatarVerdictChars = 0;
+const avatarVerdicts = new Map();   // avatar string -> 'pending' | 'ok' | 'bad'
+
+// Reads type + pixel size straight from the file header. Returns null if the
+// bytes are not a well-formed png/jpeg/gif/webp header.
+function sniffImage(b) {
+    const u16le = (i) => b[i] | (b[i + 1] << 8);
+    const u16be = (i) => (b[i] << 8) | b[i + 1];
+    const u32be = (i) => ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
+    const tag = (i, s) => { for (let k = 0; k < s.length; k++) if (b[i + k] !== s.charCodeAt(k)) return false; return true; };
+
+    if (b.length > 24 && b[0] === 0x89 && tag(1, 'PNG') && b[4] === 0x0D && b[5] === 0x0A && b[6] === 0x1A && b[7] === 0x0A && tag(12, 'IHDR')) {
+        return { mime: 'png', w: u32be(16), h: u32be(20) };
     }
-    return raw.slice(0, 16);
+    if (b.length > 10 && (tag(0, 'GIF87a') || tag(0, 'GIF89a'))) {
+        return { mime: 'gif', w: u16le(6), h: u16le(8) };
+    }
+    if (b.length > 4 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) {
+        let i = 2;
+        while (i + 9 < b.length) {
+            if (b[i] !== 0xFF) { i++; continue; }
+            const m = b[i + 1];
+            if (m === 0xFF) { i++; continue; }                          // fill byte
+            if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue; }
+            if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) {
+                return { mime: 'jpeg', h: u16be(i + 5), w: u16be(i + 7) };   // start-of-frame
+            }
+            i += 2 + u16be(i + 2);
+        }
+        return null;
+    }
+    if (b.length > 30 && tag(0, 'RIFF') && tag(8, 'WEBP')) {
+        if (tag(12, 'VP8 ')) return { mime: 'webp', w: u16le(26) & 0x3FFF, h: u16le(28) & 0x3FFF };
+        if (tag(12, 'VP8L')) return { mime: 'webp', w: 1 + (b[21] | ((b[22] & 0x3F) << 8)), h: 1 + ((b[22] >> 6) | (b[23] << 2) | ((b[24] & 0x0F) << 10)) };
+        if (tag(12, 'VP8X')) return { mime: 'webp', w: 1 + (b[24] | (b[25] << 8) | (b[26] << 16)), h: 1 + (b[27] | (b[28] << 8) | (b[29] << 16)) };
+    }
+    return null;
+}
+
+// A JPEG we would produce: header segments only up to the scan, no comment
+// segments, and it must end with the EOI marker (no appended data).
+function checkJpegStrict(b) {
+    if (b.length < 6 || b[b.length - 2] !== 0xFF || b[b.length - 1] !== 0xD9) return false;
+    let i = 2;
+    while (i + 4 < b.length) {
+        if (b[i] !== 0xFF) return false;
+        const m = b[i + 1];
+        if (m === 0xFF) { i++; continue; }
+        if (m === 0xDA) return true;                                    // start of scan
+        if (m === 0xFE) return false;                                   // comment segment
+        if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue; }
+        i += 2 + ((b[i + 2] << 8) | b[i + 3]);
+    }
+    return false;
+}
+
+// Synchronous structural check of an image data URL. Returns {mime,w,h} or null.
+function checkAvatarData(raw) {
+    if (typeof raw !== 'string' || raw.length > MAX_AVATAR_CHARS) return null;
+    const m = AVATAR_DATA_URL_RE.exec(raw);
+    if (!m) return null;
+    let bytes;
+    try {
+        const bin = atob(raw.slice(raw.indexOf(',') + 1));
+        bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch (e) { return null; }
+    const info = sniffImage(bytes);
+    if (!info || info.mime !== m[1]) return null;                       // content must match declared type
+    if (!(info.w > 0 && info.h > 0 && info.w <= MAX_AVATAR_DIM && info.h <= MAX_AVATAR_DIM)) return null;
+    if (info.mime === 'gif') {
+        try {
+            const g = parseGif(bytes, true);                            // strict: our own block types only
+            if (g.width !== info.w || g.height !== info.h) return null;
+        } catch (e) { return null; }
+    } else if (!checkJpegStrict(bytes)) {
+        return null;
+    }
+    return info;
+}
+
+function setAvatarVerdict(raw, verdict) {
+    if (!avatarVerdicts.has(raw)) {
+        avatarVerdictChars += raw.length;
+        while (avatarVerdictChars > AVATAR_VERDICT_CHAR_BUDGET && avatarVerdicts.size > 0) {
+            const oldest = avatarVerdicts.keys().next().value;          // drop oldest first
+            avatarVerdicts.delete(oldest);
+            avatarVerdictChars -= oldest.length;
+        }
+    }
+    avatarVerdicts.set(raw, verdict);
+}
+
+// Step 4: let the browser decode it once (never shown to the user until this passes).
+function verifyAvatar(raw) {
+    const info = checkAvatarData(raw);
+    if (!info) { setAvatarVerdict(raw, 'bad'); return; }
+    setAvatarVerdict(raw, 'pending');
+    const img = new Image();
+    let finished = false;
+    const finish = (ok) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        img.onload = img.onerror = null;
+        setAvatarVerdict(raw, ok ? 'ok' : 'bad');
+        if (ok) refreshAvatarViews();
+    };
+    const timer = setTimeout(() => finish(false), 8000);
+    img.onload = () => finish(img.naturalWidth > 0 && img.naturalHeight > 0 &&
+        img.naturalWidth <= MAX_AVATAR_DIM && img.naturalHeight <= MAX_AVATAR_DIM);
+    img.onerror = () => finish(false);
+    img.src = raw;
+}
+
+// What every render path uses. Always returns something safe to display:
+// an allow-listed emoji, a fully verified image data URL, or the default emoji.
+function sanitizeAvatar(raw) {
+    if (typeof raw !== 'string') return DEFAULT_AVATAR;
+    if (!raw.startsWith('data:')) return AVATAR_OPTIONS.includes(raw) ? raw : DEFAULT_AVATAR;
+    const verdict = avatarVerdicts.get(raw);
+    if (verdict === 'ok') return raw;
+    if (verdict === undefined) verifyAvatar(raw);                       // kicks off async check
+    return DEFAULT_AVATAR;                                              // pending or bad
+}
+
+// Used where an avatar is first accepted or loaded (host on JOIN, imports, storage):
+// rejects bad data early so it isn't stored or re-broadcast.
+function validateAvatar(raw) {
+    if (typeof raw !== 'string') return DEFAULT_AVATAR;
+    if (!raw.startsWith('data:')) return AVATAR_OPTIONS.includes(raw) ? raw : DEFAULT_AVATAR;
+    return checkAvatarData(raw) ? raw : DEFAULT_AVATAR;
+}
+
+// Re-draw whatever is on screen once a pending avatar has passed verification.
+function refreshAvatarViews() {
+    if (typeof renderAccountUI === 'function') renderAccountUI();
+    if (!viewPlayers.length) return;
+    if (ui.phase === 'LOBBY') renderLobbyList();
+    else if (ui.phase === 'GAME') renderRosterStatus();
+    else if (ui.phase === 'VOTING') renderVotingScreen();
 }
 
 function downloadJsonFile(filename, dataObj) {

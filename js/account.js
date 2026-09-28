@@ -17,6 +17,7 @@ function initAccount() {
         const saved = localStorage.getItem('spyfall_user_account');
         if (saved) {
             userAccount = JSON.parse(saved);
+            userAccount.avatar = validateAvatar(userAccount.avatar);
         } else {
             userAccount.id = "usr_" + Math.random().toString(36).substr(2, 9);
             userAccount.username = "Player" + Math.floor(1000 + Math.random() * 9000);
@@ -33,8 +34,15 @@ function initAccount() {
 }
 
 function saveAccount() {
-    localStorage.setItem('spyfall_user_account', JSON.stringify(userAccount));
+    let ok = true;
+    try {
+        localStorage.setItem('spyfall_user_account', JSON.stringify(userAccount));
+    } catch (e) {
+        ok = false;                       // usually: browser storage is full
+        console.warn('Could not save account:', e);
+    }
     renderAccountUI();
+    return ok;
 }
 
 // Progression curve: each level requires more XP than the last, instead of a
@@ -137,6 +145,7 @@ function importFullBackupFile(event) {
                 throw new Error("Invalid full backup file format!");
             }
             userAccount = json.account;
+            userAccount.avatar = validateAvatar(userAccount.avatar);
             saveAccount();
             const nameInput = document.getElementById('player-name');
             if (nameInput) nameInput.value = userAccount.username;
@@ -195,6 +204,7 @@ function importAccountFile(event) {
                 throw new Error("Invalid Account Profile JSON format!");
             }
             userAccount = json;
+            userAccount.avatar = validateAvatar(userAccount.avatar);
             saveAccount();
             const nameInput = document.getElementById('player-name');
             if (nameInput) nameInput.value = userAccount.username;
@@ -232,57 +242,93 @@ function recordGameEnd(role, won) {
 
 // ===== avatar =====
 
+// Always goes through sanitizeAvatar(), so whatever a peer sent is verified
+// (or replaced with the default) before it reaches innerHTML.
 function renderAvatarHTML(avatarData) {
-    if (avatarData && avatarData.startsWith('data:image/')) {
-        return `<img src="${avatarData}" alt="Avatar" style="width:100%; height:100%; object-fit:cover; border-radius:50%;" />`;
+    const safe = sanitizeAvatar(avatarData);
+    if (safe.startsWith('data:image/')) {
+        // `safe` matched a strict base64-only pattern, so it cannot break out of the attribute.
+        return `<img src="${safe}" alt="" draggable="false" decoding="async" style="width:100%; height:100%; object-fit:cover; border-radius:50%;" />`;
     }
-    return avatarData || '⚔️';
+    return escapeHtml(safe);
 }
 
-// Handle avatar image file uploading with extension and size checks.
-// The chosen file is only staged into the cropper - nothing is saved as the
-// account avatar until the user positions/zooms and confirms the crop, at
-// which point it's downscaled to a small fixed resolution.
-function handleAvatarUpload(event) {
+// Handle avatar file uploading.
+// - Max 5 MB, any resolution.
+// - The file is identified by its CONTENT (magic bytes), never by its name or the
+//   MIME type the browser reports, so scripts/HTML/SVG renamed to .png or .gif are refused.
+// - Nothing is stored until the user picks a region and confirms: the result is always
+//   re-encoded from decoded pixels at 512x512 (JPEG for images, GIF for GIFs), so none of
+//   the original file's bytes ever reach storage or other players.
+async function handleAvatarUpload(event) {
     const file = event.target.files[0];
+    event.target.value = '';
     if (!file) return;
 
-    // 1. Check File Size on the ORIGINAL upload (it gets downscaled before storage,
-    // this just protects against the browser choking on a huge source image).
-    const MAX_SIZE_BYTES = 8 * 1024 * 1024; // 8 MB
-    if (file.size > MAX_SIZE_BYTES) {
-        alert("File size exceeds 8 MB limit! Please choose a smaller image.");
-        event.target.value = '';
+    if (file.size > MAX_UPLOAD_BYTES) {
+        alert("File is larger than 5 MB! Please choose a smaller image or GIF.");
         return;
     }
 
-    // 2. Check Extension and MIME type
-    const allowedExtensions = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'svg'];
-    const fileExtension = file.name.split('.').pop().toLowerCase();
-    const isImageMime = file.type.startsWith('image/');
-
-    if (!isImageMime || !allowedExtensions.includes(fileExtension)) {
-        alert("Invalid file type! Please upload an image file (.jpg, .png, .webp, .gif, .svg).");
-        event.target.value = '';
-        return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = function (e) {
-        const img = new Image();
-        img.onload = function () {
-            openCropModal(img);
-        };
-        img.onerror = function () {
-            alert("Could not load that image. Please try a different file.");
-        };
-        img.src = e.target.result;
-    };
-    reader.onerror = function () {
+    let bytes;
+    try {
+        bytes = new Uint8Array(await file.arrayBuffer());
+    } catch (e) {
         alert("Could not read that file.");
-    };
-    reader.readAsDataURL(file);
-    event.target.value = '';
+        return;
+    }
+
+    const info = sniffImage(bytes);
+    if (!info) {
+        alert("That file is not a real PNG, JPEG, GIF or WebP image, so it was rejected.");
+        return;
+    }
+
+    try {
+        if (info.mime === 'gif') {
+            await openGifCropper(bytes);
+        } else {
+            await openStaticCropper(bytes, info.mime);
+        }
+    } catch (e) {
+        alert("Could not load that image: " + (e && e.message ? e.message : e));
+    }
+}
+
+function openStaticCropper(bytes, mime) {
+    return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(new Blob([bytes], { type: 'image/' + mime }));
+        const img = new Image();
+        img.onload = () => {
+            URL.revokeObjectURL(url);
+            if (!img.width || !img.height) { reject(new Error("The image has no size.")); return; }
+            openCropModal(img, null);
+            resolve();
+        };
+        img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("The browser could not decode that image.")); };
+        img.src = url;
+    });
+}
+
+// Animated GIFs: decode the first frame for the region picker; the chosen region is
+// applied to every frame when the user confirms.
+async function openGifCropper(bytes) {
+    const g = parseGif(bytes, false);
+    if (g.width * g.height > GIF_MAX_CANVAS_PIXELS) {
+        throw new Error("This GIF canvas (" + g.width + "x" + g.height + ") is too large to process in the browser.");
+    }
+    const rgba = await gifFirstFrame(bytes, g);
+    if (!rgba) throw new Error("Could not read the first frame of that GIF.");
+
+    // Preview copy: at most 1024 px on the long side (the full-size frames are only used at confirm time).
+    const s = Math.min(1, 1024 / Math.max(g.width, g.height));
+    const pw = Math.max(1, Math.round(g.width * s)), ph = Math.max(1, Math.round(g.height * s));
+    const preview = resampleRGBA(rgba, g.width, g.height, 0, 0, g.width, g.height, pw, ph);
+    const canvas = document.createElement('canvas');
+    canvas.width = pw; canvas.height = ph;
+    canvas.getContext('2d').putImageData(new ImageData(preview, pw, ph), 0, 0);
+
+    openCropModal(canvas, { bytes, width: g.width, height: g.height, previewScale: pw / g.width });
 }
 
 // --- AVATAR CROPPER (pan + zoom, then downscale to a small fixed size) ---
@@ -297,11 +343,14 @@ const cropState = {
     lastX: 0,
     lastY: 0,
     stageSize: 280,   // on-screen crop canvas size (px)
-    outputSize: 220   // final stored/synced avatar resolution (px) - kept small on purpose
+    gif: null,        // { bytes, width, height, previewScale } when cropping an animated GIF
+    busy: false
 };
 
-function openCropModal(img) {
+function openCropModal(img, gifInfo) {
     cropState.img = img;
+    cropState.gif = gifInfo || null;
+    setCropBusy(false, '');
     const stage = cropState.stageSize;
     cropState.minScale = stage / Math.min(img.width, img.height);
     cropState.maxScale = cropState.minScale * 4;
@@ -396,39 +445,102 @@ function setupCropCanvasEvents() {
     canvas.addEventListener('touchcancel', cropPointerUp);
 }
 
-function confirmAvatarCrop() {
-    const cropCanvas = document.getElementById('crop-canvas');
-    if (!cropCanvas || !cropState.img) return;
+// The square of the source image (in the source's own pixels) that is inside the crop circle.
+function getCropRegion() {
+    const img = cropState.img, sc = cropState.scale;
+    const size = cropState.stageSize / sc;
+    let x = img.width / 2 + cropState.offsetX / sc - size / 2;
+    let y = img.height / 2 + cropState.offsetY / sc - size / 2;
+    x = Math.max(0, Math.min(img.width - size, x));
+    y = Math.max(0, Math.min(img.height - size, y));
+    return { x, y, size };
+}
 
-    // Downscale the already-cropped view into a small fixed-size output canvas.
-    // This keeps synced avatars tiny (a few KB) instead of multi-MB uploads
-    // clogging the PeerJS data channel to every connected player.
-    const outCanvas = document.createElement('canvas');
-    outCanvas.width = cropState.outputSize;
-    outCanvas.height = cropState.outputSize;
-    const outCtx = outCanvas.getContext('2d');
-    outCtx.imageSmoothingEnabled = true;
-    outCtx.imageSmoothingQuality = 'high';
-    outCtx.drawImage(cropCanvas, 0, 0, cropState.stageSize, cropState.stageSize, 0, 0, cropState.outputSize, cropState.outputSize);
+function setCropBusy(busy, text) {
+    cropState.busy = busy;
+    const status = document.getElementById('crop-status');
+    if (status) status.innerText = text || '';
+    const ok = document.getElementById('crop-confirm-btn');
+    if (ok) ok.disabled = busy;
+    const zoom = document.getElementById('crop-zoom');
+    if (zoom) zoom.disabled = busy;
+}
 
-    let dataUrl;
-    try {
-        dataUrl = outCanvas.toDataURL('image/jpeg', 0.85);
-    } catch (e) {
-        alert("Could not process that image (it may be blocked from being read by the browser). Try a different file.");
-        return;
+function bytesToBase64(bytes) {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
     }
+    return btoa(bin);
+}
 
-    userAccount.avatar = dataUrl;
-    saveAccount();
-    setupAvatarSelector();
-    closeModal('crop-modal');
-    cropState.img = null;
+// Static image -> 512x512 JPEG of exactly the chosen region.
+function buildStaticAvatar() {
+    const r = getCropRegion();
+    const out = document.createElement('canvas');
+    out.width = out.height = AVATAR_OUT_SIZE;
+    const ctx = out.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.fillStyle = '#1a1e26';                    // JPEG has no transparency
+    ctx.fillRect(0, 0, AVATAR_OUT_SIZE, AVATAR_OUT_SIZE);
+    ctx.drawImage(cropState.img, r.x, r.y, r.size, r.size, 0, 0, AVATAR_OUT_SIZE, AVATAR_OUT_SIZE);
+
+    for (const q of [0.9, 0.8, 0.7, 0.55, 0.4]) {
+        const url = out.toDataURL('image/jpeg', q);
+        if (url.length * 0.75 <= AVATAR_STORE_BUDGET) return url;
+    }
+    throw new Error("The picture is too detailed to fit the avatar size limit.");
+}
+
+// Animated GIF -> new 512x512 GIF, region applied to every frame.
+async function buildAnimatedAvatar() {
+    const g = cropState.gif;
+    const r = getCropRegion();
+    const inv = 1 / g.previewScale;                 // preview px -> real GIF px
+    const region = { x: r.x * inv, y: r.y * inv, size: r.size * inv };
+    const bytes = await gifToAvatarGif(g.bytes, region, AVATAR_OUT_SIZE, AVATAR_STORE_BUDGET, (msg) => {
+        const status = document.getElementById('crop-status');
+        if (status) status.innerText = msg;
+    });
+    return 'data:image/gif;base64,' + bytesToBase64(bytes);
+}
+
+async function confirmAvatarCrop() {
+    if (!cropState.img || cropState.busy) return;
+    setCropBusy(true, cropState.gif ? 'Processing GIF...' : 'Processing...');
+    await new Promise(r => setTimeout(r, 30));      // let the status text paint first
+
+    try {
+        const dataUrl = cropState.gif ? await buildAnimatedAvatar() : buildStaticAvatar();
+
+        // Final gate: what we are about to store/broadcast must pass the exact
+        // checks every other player will run on it.
+        if (!checkAvatarData(dataUrl)) throw new Error("The result failed the avatar safety check.");
+
+        const previous = userAccount.avatar;
+        userAccount.avatar = dataUrl;
+        if (!saveAccount()) {
+            userAccount.avatar = previous;
+            saveAccount();
+            throw new Error("Your browser storage is full, so the avatar could not be saved.");
+        }
+        setupAvatarSelector();
+        closeModal('crop-modal');
+        cropState.img = null;
+        cropState.gif = null;
+    } catch (e) {
+        alert("Could not create the avatar: " + (e && e.message ? e.message : e));
+    } finally {
+        setCropBusy(false, '');
+    }
 }
 
 function cancelAvatarCrop() {
+    if (cropState.busy) return;                     // let the running job finish
     closeModal('crop-modal');
     cropState.img = null;
+    cropState.gif = null;
     const fileInput = document.getElementById('avatar-file-input');
     if (fileInput) fileInput.value = '';
 }

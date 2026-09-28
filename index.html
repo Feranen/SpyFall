@@ -7,6 +7,7 @@
     <title>Dota 2 Spyfall - Serverless Multiplayer & Accounts</title>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <script defer src="js/core.js"></script>
+    <script defer src="js/gif.js"></script>
     <script defer src="js/presets.js"></script>
     <script defer src="js/account.js"></script>
     <script defer src="js/client.js"></script>
@@ -234,7 +235,7 @@
 
                 <!-- Custom Image Upload Input -->
                 <div style="margin-top: 10px;">
-                    <label for="avatar-file-input">Custom Profile Picture (&lt; 8 MB, you'll crop it next)</label>
+                    <label for="avatar-file-input">Custom Profile Picture (PNG, JPG, WebP or GIF, up to 5 MB, any resolution - you pick the region and it is resized to 512x512; GIFs stay animated)</label>
                     <input type="file" id="avatar-file-input"
                         accept="image/png, image/jpeg, image/jpg, image/webp, image/gif, image/svg+xml"
                         onchange="handleAvatarUpload(event)" />
@@ -303,6 +304,7 @@
             <div class="modal-title">Adjust Your Profile Picture</div>
             <div style="font-size: 0.75rem; color: var(--text-dim); margin-bottom: 10px;">
                 Drag to reposition, use the slider to zoom. Only what's inside the circle is saved.
+                For animated GIFs the preview shows the first frame; the region you pick is applied to every frame.
             </div>
 
             <div class="crop-stage">
@@ -315,9 +317,11 @@
                     oninput="cropZoomChanged(this.value)">
             </div>
 
+            <div id="crop-status" style="min-height: 1.2em; margin-top: 8px; font-size: 0.8rem; color: var(--accent-gold); text-align: center;"></div>
+
             <div class="btn-row" style="margin-top: 6px;">
-                <button class="btn btn-green" onclick="confirmAvatarCrop()">✅ Use This Photo</button>
-                <button class="btn btn-secondary" onclick="cancelAvatarCrop()">Cancel</button>
+                <button class="btn btn-green" id="crop-confirm-btn" onclick="confirmAvatarCrop()">✅ Use This Photo</button>
+                <button class="btn btn-secondary" id="crop-cancel-btn" onclick="cancelAvatarCrop()">Cancel</button>
             </div>
         </div>
     </div>
