@@ -737,3 +737,18 @@ textarea:focus {
 #spy-guess-btn {
     margin-top: 12px;
 }
+
+/* Leave room button */
+.btn-leave {
+    background-color: transparent;
+    border: 1px solid var(--accent-red);
+    color: var(--accent-red);
+    margin-top: 18px;
+    font-size: 0.8rem;
+    padding: 8px;
+}
+
+.btn-leave:hover {
+    background-color: var(--accent-red);
+    color: #fff;
+}

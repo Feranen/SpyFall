@@ -121,6 +121,8 @@ function showScreen(id) {
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     const target = document.getElementById(id);
     if (target) target.classList.add('active');
+    const leaveBtn = document.getElementById('leave-room-btn');
+    if (leaveBtn) leaveBtn.style.display = (id === 'screen-welcome') ? 'none' : 'block';
 }
 
 function updateStatus(text) {

@@ -264,6 +264,24 @@ function handleHostMessage(conn, data) {
             break;
         }
 
+        case 'LEAVE':
+            if (!p || p.isHost) return;
+            if (G.phase === 'LOBBY') {
+                // Nothing to preserve in the lobby: drop them from the list entirely.
+                delete hostConnections[p.id];
+                playerList = playerList.filter(x => x.accountId !== p.accountId);
+                delete G.roles[p.accountId];
+                delete G.votes[p.accountId];
+                try { conn.close(); } catch (e) { }
+            } else {
+                // Mid-round: keep their seat/role (they can rejoin), just show them offline.
+                delete hostConnections[p.id];
+                p.isOnline = false;
+                try { conn.close(); } catch (e) { }
+            }
+            syncAll();
+            break;
+
         case 'SPY_GUESS':
             if (!p || G.phase !== 'GAME' || G.roles[p.accountId] !== 'SPY') return;
             hostResolveSpyGuess(p.accountId, typeof data.guess === 'string' ? data.guess : '');

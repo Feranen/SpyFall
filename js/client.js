@@ -51,12 +51,29 @@ function reconnectLastRoom() {
 }
 
 function leaveRoom() {
+    const msg = isHost
+        ? "You are the host. Leaving will close the room for everyone. Leave anyway?"
+        : "Leave this room?";
+    if (roomCode && !confirm(msg)) return;
+
     leaving = true;
-    resetNetworking();
-    sessionStorage.removeItem('spyfall_active_room');
-    sessionStorage.removeItem('spyfall_active_role');
-    sessionStorage.removeItem(HOST_STATE_KEY);
-    location.reload();
+    let delay = 0;
+    if (isHost) {
+        // Tell everyone the room is closing so they don't sit retrying forever.
+        Object.values(hostConnections).forEach(c => safeSend(c, { type: 'ROOM_CLOSED' }));
+        delay = 250;
+    } else if (myConnection && myConnection.open) {
+        safeSend(myConnection, { type: 'LEAVE' });
+        delay = 250;    // give the message a moment to go out before the link is torn down
+    }
+
+    setTimeout(() => {
+        resetNetworking();
+        sessionStorage.removeItem('spyfall_active_room');
+        sessionStorage.removeItem('spyfall_active_role');
+        sessionStorage.removeItem(HOST_STATE_KEY);
+        location.reload();
+    }, delay);
 }
 
 function teardownPeer() {
@@ -237,6 +254,13 @@ function handleClientMessage(data) {
             break;
         case 'REJOIN':
             sendJoin();
+            break;
+        case 'ROOM_CLOSED':
+            leaving = true;
+            alert("The host closed the room.");
+            sessionStorage.removeItem('spyfall_active_room');
+            sessionStorage.removeItem('spyfall_active_role');
+            location.reload();
             break;
         case 'KICKED':
             leaving = true;
