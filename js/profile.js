@@ -141,6 +141,7 @@ function renderProfileCard(d) {
     const prog = hasStats ? computeLevelProgress(sanitizeXp(d.xp)) : null;
     const level = prog ? prog.level : (Number.isFinite(d.level) ? d.level : 1);
     const rank = profileRank(level);
+    body.parentElement.style.setProperty('--rank', rank.color);
 
     // header
     const head = profileEl('div', 'pc-head');
