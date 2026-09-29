@@ -14,9 +14,11 @@
     <script defer src="js/host.js"></script>
     <script defer src="js/ui.js"></script>
     <script defer src="js/friends.js"></script>
+    <script defer src="js/profile.js"></script>
     <script defer src="js/main.js"></script>
     <link rel="stylesheet" href="style.css">
     <link rel="stylesheet" href="friends.css">
+    <link rel="stylesheet" href="profile.css">
 </head>
 
 <body>
@@ -274,6 +276,12 @@
                     <div class="stat-label">Innocent Wins</div>
                 </div>
             </div>
+
+            <label class="checkbox-group">
+                <input type="checkbox" id="pref-share-stats" onchange="profileSetShareStats(this.checked)">
+                <div>Share my stats on my profile card<div style="font-size: 0.75rem; color: var(--text-dim);">Other players in your room can see your level, XP and win stats.</div></div>
+            </label>
+            <button class="btn btn-blue" onclick="closeModal('account-modal'); openProfileCard(userAccount.id)">🪪 Preview My Profile Card</button>
 
             <div class="btn-row" style="margin-top: 15px;">
                 <button class="btn btn-blue" onclick="exportAccountFile()">📤 Export Profile</button>

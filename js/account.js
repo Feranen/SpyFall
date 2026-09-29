@@ -112,6 +112,8 @@ function updateAccountName(newName) {
 
 function openAccountModal() {
     renderAccountUI();
+    const shareCb = document.getElementById('pref-share-stats');
+    if (shareCb) shareCb.checked = !userAccount.hideStats;
     openModal('account-modal');
 }
 

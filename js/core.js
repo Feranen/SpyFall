@@ -230,6 +230,7 @@ function validateAvatar(raw) {
 // Re-draw whatever is on screen once a pending avatar has passed verification.
 function refreshAvatarViews() {
     if (typeof renderAccountUI === 'function') renderAccountUI();
+    if (typeof profileRefresh === 'function') profileRefresh();
     if (!viewPlayers.length) return;
     if (ui.phase === 'LOBBY') renderLobbyList();
     else if (ui.phase === 'GAME') renderRosterStatus();

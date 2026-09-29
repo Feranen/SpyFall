@@ -6,6 +6,7 @@
 document.addEventListener('DOMContentLoaded', () => {
     initAccount();
     friendsInit();
+    profileInit();
     scanAndSyncPresets();
     setupCropCanvasEvents();
     setInterval(uiTick, 250);

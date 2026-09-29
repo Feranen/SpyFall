@@ -24,7 +24,7 @@ function refreshHostSelf() {
     if (!me) { me = { isHost: true }; playerList.unshift(me); }
     Object.assign(me, {
         id: myPeerId, accountId: userAccount.id, name: sanitizeName(userAccount.username, 'Host'),
-        avatar: validateAvatar(userAccount.avatar), level: userAccount.level, friendCode: friendsShareCode(), isHost: true, isOnline: true, lastSeen: Date.now()
+        avatar: validateAvatar(userAccount.avatar), level: userAccount.level, friendCode: friendsShareCode(), ...profileShared(), isHost: true, isOnline: true, lastSeen: Date.now()
     });
 }
 
@@ -35,7 +35,7 @@ function persistHost() {
             roomCode,
             G: Object.assign({}, G, { timer: { ms: timerMsNow(G.timer), paused: G.timer.paused, at: 0 } }),
             players: playerList.map(p => ({
-                accountId: p.accountId, name: p.name, level: p.level, isHost: !!p.isHost, friendCode: p.friendCode || '',
+                accountId: p.accountId, name: p.name, level: p.level, isHost: !!p.isHost, friendCode: p.friendCode || '', xp: p.xp || 0, stats: p.stats || null,
                 avatar: (typeof p.avatar === 'string' && p.avatar.startsWith('data:')) ? "⚔️" : p.avatar
             }))
         }));
@@ -178,7 +178,7 @@ function buildStateFor(p, conn) {
         room: roomCode, me: p.accountId,
         players: playerList.map(q => {
             const key = avatarKey(q);
-            const o = { accountId: q.accountId, name: q.name, level: q.level, isHost: !!q.isHost, isOnline: !!q.isOnline, avKey: key, friendCode: q.friendCode || '' };
+            const o = { accountId: q.accountId, name: q.name, level: q.level, isHost: !!q.isHost, isOnline: !!q.isOnline, avKey: key, friendCode: q.friendCode || '', xp: q.xp || 0, stats: q.stats || null };
             // Avatars can be tens of KB: only send when this connection hasn't seen this version.
             if (!conn || conn._avSent[q.accountId] !== key) {
                 o.avatar = q.avatar;
@@ -295,6 +295,7 @@ function hostHandleJoin(conn, data) {
     const avatar = validateAvatar(data.avatar);
     const level = Number.isFinite(data.level) ? data.level : 1;
     const friendCode = normalizeCode(data.friendCode);
+    const shared = data.stats ? { xp: sanitizeXp(data.xp), stats: sanitizeStats(data.stats) } : { xp: 0, stats: null };
     let p = playerList.find(x => x.accountId === accId);
 
     if (p) {
@@ -311,13 +312,14 @@ function hostHandleJoin(conn, data) {
         }
         p.id = conn.peer;
         p.name = name; p.avatar = avatar; p.level = level; p.friendCode = friendCode;
+        Object.assign(p, shared);
     } else {
         if (G.phase !== 'LOBBY') {
             safeSend(conn, { type: 'KICKED', reason: 'Match already in progress.' });
             setTimeout(() => { try { conn.close(); } catch (e) { } }, 150);
             return;
         }
-        p = { id: conn.peer, accountId: accId, name, avatar, level, friendCode, isHost: false };
+        p = Object.assign({ id: conn.peer, accountId: accId, name, avatar, level, friendCode, isHost: false }, shared);
         playerList.push(p);
     }
 

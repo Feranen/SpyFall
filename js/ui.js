@@ -73,6 +73,7 @@ function applyState(s) {
     }
 
     if (s.phase !== 'GAME') closeModal('spy-guess-modal');
+    if (typeof profileRefresh === 'function') profileRefresh();
 }
 
 function uiTimerMs() { return timerMsNow(ui.timer); }
@@ -104,9 +105,8 @@ function renderLobbyList() {
     viewPlayers.forEach(p => {
         const div = document.createElement('div');
         div.className = `player-item ${!p.isOnline ? 'offline' : ''}`;
-        const safeAccId = escapeHtml(String(p.accountId));
         const kickBtnHtml = (isHost && !p.isHost)
-            ? `<button class="sm-btn" style="background:var(--accent-red); color:#fff; margin-left:8px;" onclick="kickPlayer('${safeAccId}')">Remove</button>`
+            ? `<button class="sm-btn pc-kick" style="background:var(--accent-red); color:#fff; margin-left:8px;">Remove</button>`
             : '';
         const fc = normalizeCode(p.friendCode);
         const addFriendHtml = friendsCanAdd(fc)
@@ -124,6 +124,9 @@ function renderLobbyList() {
                 ${addFriendHtml}
                 ${kickBtnHtml}
             </div>`;
+        const kickBtn = div.querySelector('.pc-kick');
+        if (kickBtn) kickBtn.onclick = () => kickPlayer(p.accountId);
+        profileMakeClickable(div.querySelector('.player-item-left'), p.accountId);
         listElem.appendChild(div);
     });
 }
@@ -141,6 +144,7 @@ function renderRosterStatus() {
                 <strong>${escapeHtml(p.name)}</strong>
             </div>
             <div>${statusPill(p, 'RECONNECTING...')}</div>`;
+        profileMakeClickable(div.querySelector('.player-item-left'), p.accountId);
         container.appendChild(div);
     });
 }
@@ -243,8 +247,10 @@ function renderVotingScreen() {
                 <strong>${escapeHtml(p.name)}${p.accountId === myAccountId ? ' (You)' : ''}</strong>
                 ${statusPill(p, 'OFFLINE')}
             </div>
-            <div style="font-size:0.8rem; color:var(--accent-gold);">Accuse 🎯</div>`;
+            <div style="display:flex; align-items:center; gap:8px; font-size:0.8rem; color:var(--accent-gold);"><button type="button" class="sm-btn pc-info" title="View profile">🪪</button>Accuse 🎯</div>`;
         div.onclick = () => castVote(p.accountId);
+        const infoBtn = div.querySelector('.pc-info');
+        if (infoBtn) infoBtn.onclick = (e) => { e.stopPropagation(); openProfileCard(p.accountId); };
         list.appendChild(div);
     });
 

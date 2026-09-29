@@ -133,7 +133,8 @@ function sendJoin() {
     safeSend(myConnection, {
         type: 'JOIN', accountId: userAccount.id, name: userAccount.username,
         avatar: userAccount.avatar, level: userAccount.level,
-        friendCode: friendsShareCode()
+        friendCode: friendsShareCode(),
+        ...profileShared()
     });
 }
 
