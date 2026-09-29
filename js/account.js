@@ -34,6 +34,7 @@ function initAccount() {
 }
 
 function saveAccount() {
+    if (typeof ensureFriendCode === 'function') ensureFriendCode();
     let ok = true;
     try {
         localStorage.setItem('spyfall_user_account', JSON.stringify(userAccount));
@@ -124,7 +125,8 @@ function exportFullBackup() {
         type: 'spyfall_full_backup',
         version: 1,
         account: userAccount,
-        presets: getStoredPresets()
+        presets: getStoredPresets(),
+        friends: friendsExport()
     });
 }
 
@@ -153,6 +155,8 @@ function importFullBackupFile(event) {
             if (json.presets && typeof json.presets === 'object') {
                 savePresetsToStorage(json.presets);
             }
+            if (json.friends) friendsImport(json.friends);
+            friendsOnAccountChanged();
 
             alert(`Full backup restored! Welcome back, ${userAccount.username}.`);
         } catch (err) {
@@ -176,6 +180,8 @@ function deleteAllLocalData() {
     try {
         localStorage.removeItem('spyfall_user_account');
         localStorage.removeItem('spyfall_presets');
+        localStorage.removeItem('spyfall_friends');
+        sessionStorage.removeItem('spyfall_pending_join');
         sessionStorage.removeItem('spyfall_active_room');
         sessionStorage.removeItem('spyfall_active_role');
         sessionStorage.removeItem('spyfall_host_state');
@@ -208,6 +214,7 @@ function importAccountFile(event) {
             saveAccount();
             const nameInput = document.getElementById('player-name');
             if (nameInput) nameInput.value = userAccount.username;
+            friendsOnAccountChanged();
             alert(`Welcome back, ${userAccount.username}! Account profile restored successfully.`);
         } catch (err) {
             alert("Failed to restore profile: " + err.message);

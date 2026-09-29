@@ -50,11 +50,11 @@ function reconnectLastRoom() {
     }
 }
 
-function leaveRoom() {
+function leaveRoom(skipConfirm) {
     const msg = isHost
         ? "You are the host. Leaving will close the room for everyone. Leave anyway?"
         : "Leave this room?";
-    if (roomCode && !confirm(msg)) return;
+    if (roomCode && skipConfirm !== true && !confirm(msg)) return;
 
     leaving = true;
     let delay = 0;
@@ -132,7 +132,8 @@ function joinRoom() {
 function sendJoin() {
     safeSend(myConnection, {
         type: 'JOIN', accountId: userAccount.id, name: userAccount.username,
-        avatar: userAccount.avatar, level: userAccount.level
+        avatar: userAccount.avatar, level: userAccount.level,
+        friendCode: friendsShareCode()
     });
 }
 

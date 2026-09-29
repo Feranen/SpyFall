@@ -5,6 +5,7 @@
 // ---- boot ------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
     initAccount();
+    friendsInit();
     scanAndSyncPresets();
     setupCropCanvasEvents();
     setInterval(uiTick, 250);

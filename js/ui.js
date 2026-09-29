@@ -108,6 +108,10 @@ function renderLobbyList() {
         const kickBtnHtml = (isHost && !p.isHost)
             ? `<button class="sm-btn" style="background:var(--accent-red); color:#fff; margin-left:8px;" onclick="kickPlayer('${safeAccId}')">Remove</button>`
             : '';
+        const fc = normalizeCode(p.friendCode);
+        const addFriendHtml = friendsCanAdd(fc)
+            ? `<button class="sm-btn btn-blue" title="Send friend request" onclick="friendsAddFromLobby('${fc}')">➕</button>`
+            : '';
         div.innerHTML = `
             <div class="player-item-left">
                 <span class="account-avatar" style="width:28px; height:28px; border:none;">${renderAvatarHTML(p.avatar)}</span>
@@ -117,6 +121,7 @@ function renderLobbyList() {
             </div>
             <div>
                 ${p.isHost ? '<span class="player-host-badge">[HOST]</span>' : ''}
+                ${addFriendHtml}
                 ${kickBtnHtml}
             </div>`;
         listElem.appendChild(div);
