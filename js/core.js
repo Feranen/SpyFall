@@ -69,6 +69,164 @@ function timerMsNow(t) {
 function playerByPeer(peerId) { return playerList.find(p => p.id === peerId); }
 
 // =====================================================================
+// SERVERLESS ROLE VALIDATION  (commit-reveal, runs entirely in the browsers)
+// =====================================================================
+// Problem: the host is the only one who knows the roles, so a modified host
+// could quietly change a role mid-round or announce a result that doesn't
+// match what it dealt. There is no server to arbitrate, so we use a
+// commit-reveal scheme instead:
+//   1. At round start the host picks a random salt per player and publishes
+//      commit = SHA-256([gameId, accountId, role, salt]) for EVERYONE.
+//      The role itself stays private (a hash with a 128-bit salt reveals nothing).
+//   2. Each player gets their own role + salt privately and checks it against
+//      their commitment. Commitments are pinned on first sight, so the host
+//      cannot swap them later.
+//   3. At REVEAL the host publishes every {role, salt}. Every client re-hashes
+//      them against the pinned commitments and cross-checks the announced
+//      spies / jester / secret target.
+// It proves the host did not change roles after dealing. It does not prove
+// the host drew them fairly in the first place.
+
+function roleCryptoOk() {
+    return !!(window.crypto && crypto.subtle && crypto.getRandomValues && window.TextEncoder);
+}
+
+async function sha256Hex(str) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+    return Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function newRoleSalt() {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+}
+
+// JSON-encoding the tuple keeps the input unambiguous even if a name contains separators.
+function roleCommitOf(gameId, accountId, role, salt) {
+    return sha256Hex(JSON.stringify(['spyfall-role-v1', gameId, accountId, role, salt]));
+}
+
+// Host: commit to every role. Returns { salts, commits } keyed by accountId.
+async function buildRoleCommitments(gameId, roles) {
+    const salts = {}, commits = {};
+    for (const id of Object.keys(roles)) {
+        salts[id] = newRoleSalt();
+        commits[id] = await roleCommitOf(gameId, id, roles[id], salts[id]);
+    }
+    return { salts, commits };
+}
+
+// Cheap structural check of a role against the round's rules ('' = fine).
+// `deck` may be empty if it hasn't arrived yet; membership checks are then skipped.
+function roleShapeError(role, secret, deck) {
+    const hasDeck = Array.isArray(deck) && deck.length > 0;
+    if (typeof role !== 'string' || !role) return 'no role was assigned';
+    if (role === 'SPY') return secret ? 'a Spy must never be sent the secret' : '';
+    if (role === 'JESTER') {
+        if (!secret) return 'the Jester was not told the target';
+        return (hasDeck && !deck.includes(secret)) ? 'Jester target is not in the word pack' : '';
+    }
+    if (hasDeck && !deck.includes(role)) return 'role is not in the word pack';
+    return secret === role ? '' : 'secret target does not match the role';
+}
+
+function setRoleCheck(which, state, msg, gameId) {
+    ui[which] = { state, msg, gameId: gameId || '' };
+    renderRoleVerify();
+}
+
+function renderRoleVerify() {
+    const icons = { ok: '✅ ', fail: '⚠️ ', pending: '⏳ ', unavailable: 'ℹ️ ' };
+    const paint = (el, c) => {
+        if (!el) return;
+        if (!c || c.state === 'none') { el.style.display = 'none'; return; }
+        el.style.display = 'block';
+        el.className = 'role-verify rv-' + c.state;
+        el.textContent = (icons[c.state] || '') + c.msg;
+    };
+    paint(document.getElementById('role-verify'), ui.roleCheck);
+    paint(document.getElementById('reveal-verify'), ui.revealCheck);
+}
+
+// Every client: verify the role we were dealt against the pinned commitment.
+async function verifyOwnRole(s) {
+    const g = s && s.game;
+    if (!g) return;
+    const gid = s.gameId;
+
+    // Pin commitments the first time we see them for this round; flag any later change.
+    if (ui.commitsGameId !== gid) {
+        ui.commitsGameId = gid;
+        ui.commits = s.commits ? Object.assign({}, s.commits) : null;
+        setRoleCheck('roleCheck', 'pending', 'Verifying your role…', gid);
+        setRoleCheck('revealCheck', 'none', '', gid);
+    } else if (s.commits) {
+        if (!ui.commits) ui.commits = {};
+        for (const id of Object.keys(s.commits)) {
+            if (ui.commits[id] === undefined) ui.commits[id] = s.commits[id];
+            else if (ui.commits[id] !== s.commits[id]) {
+                setRoleCheck('roleCheck', 'fail', 'The host changed the role commitments mid-round. Do not trust this round.', gid);
+                return;
+            }
+        }
+    }
+    if (ui.roleCheck.state === 'fail' && ui.roleCheck.gameId === gid) return;   // a failure sticks
+
+    const deck = (ui.deckGameId === gid) ? ui.deck : [];
+    const shapeErr = roleShapeError(g.role, g.secretTarget, deck);
+    if (shapeErr) { setRoleCheck('roleCheck', 'fail', 'Invalid role from host: ' + shapeErr + '.', gid); return; }
+
+    if (!roleCryptoOk()) { setRoleCheck('roleCheck', 'unavailable', 'Role verification needs https:// or localhost.', gid); return; }
+    const pinned = ui.commits && ui.commits[s.me];
+    if (!pinned || !g.salt) { setRoleCheck('roleCheck', 'unavailable', 'This host did not provide a role commitment (older version).', gid); return; }
+
+    const key = [gid, s.me, g.role, g.salt, pinned].join('|');
+    if (ui.roleCheck.key === key) return;
+    const calc = await roleCommitOf(gid, s.me, g.role, g.salt);
+    if (ui.commitsGameId !== gid) return;                         // round changed while hashing
+    if (calc === pinned) setRoleCheck('roleCheck', 'ok', 'Role verified: it matches what the host committed to at round start.', gid);
+    else setRoleCheck('roleCheck', 'fail', 'Your role does not match the host\'s commitment. The host may have changed it.', gid);
+    ui.roleCheck.key = key;
+}
+
+// Every client: at REVEAL, re-hash every published role against the pinned commitments
+// and cross-check the announced result.
+async function verifyReveal(result, gid) {
+    const fail = (m) => setRoleCheck('revealCheck', 'fail', m, gid);
+    if (!result || !result.reveal || typeof result.reveal !== 'object') {
+        setRoleCheck('revealCheck', 'unavailable', 'This host did not publish roles for verification.', gid); return;
+    }
+    if (!roleCryptoOk()) { setRoleCheck('revealCheck', 'unavailable', 'Verification needs https:// or localhost.', gid); return; }
+    const commits = (ui.commitsGameId === gid) ? ui.commits : null;
+    if (!commits) { setRoleCheck('revealCheck', 'unavailable', 'No round-start commitments to check against.', gid); return; }
+
+    const nameOf = (id) => { const p = viewPlayers.find(x => x.accountId === id); return p ? p.name : id; };
+    const deck = (ui.deckGameId === gid) ? ui.deck : [];
+    const spies = [];
+    let jester = null, count = 0;
+
+    for (const id of Object.keys(result.reveal)) {
+        const e = result.reveal[id];
+        if (!e || typeof e.role !== 'string' || typeof e.salt !== 'string') return fail('Malformed role data for ' + nameOf(id) + '.');
+        if (commits[id] === undefined) return fail(nameOf(id) + ' had no commitment at round start.');
+        if (await roleCommitOf(gid, id, e.role, e.salt) !== commits[id]) return fail('The role shown for ' + nameOf(id) + ' does not match the commitment.');
+        if (e.role === 'SPY') spies.push(nameOf(id));
+        else if (e.role === 'JESTER') { if (jester) return fail('More than one Jester was revealed.'); jester = nameOf(id); }
+        else if (e.role !== result.secretTarget) return fail(nameOf(id) + ' was not a Spy or Jester but did not hold the secret target.');
+        count++;
+    }
+    if (ui.commitsGameId !== gid) return;
+    if (!count) return fail('No roles were revealed.');
+    if (myAccountId && result.reveal[myAccountId] && ui.role && result.reveal[myAccountId].role !== ui.role) return fail('The role revealed for you differs from the one you were dealt.');
+    if (deck.length && !deck.includes(result.secretTarget)) return fail('The announced secret target is not in the word pack.');
+    if ([...spies].sort().join('\n') !== [...(result.spies || [])].sort().join('\n')) return fail('The announced Spies do not match the committed roles.');
+    if ((result.jester || null) !== jester) return fail('The announced Jester does not match the committed roles.');
+    if (result.winner === 'JESTER' && !jester) return fail('Jester declared the winner, but there was no Jester.');
+    setRoleCheck('revealCheck', 'ok', 'Verified: all ' + count + ' roles match the commitments made at round start.', gid);
+}
+
+// =====================================================================
 // AVATAR SAFETY
 // Every peer (host AND clients) runs these checks on every avatar it is about
 // to display, no matter who sent it. Nothing from the network is trusted:
@@ -359,6 +517,8 @@ function newGameState() {
         gameId: '',
         secret: '',
         roles: {},            // accountId -> target | 'SPY' | 'JESTER'
+        salts: {},            // accountId -> random salt (private; sent only to that player until REVEAL)
+        commits: {},          // accountId -> SHA-256 commitment to (gameId, accountId, role, salt)
         deck: [],
         facts: {},
         starter: '',
@@ -386,5 +546,10 @@ const ui = {
     result: null,
     roleVisible: false,
     spyGuessSent: false,
-    pendingGuess: ''
+    pendingGuess: '',
+    // serverless role validation
+    commits: null,            // commitments pinned the first time we see them this round
+    commitsGameId: '',
+    roleCheck: { state: 'none', msg: '', gameId: '' },
+    revealCheck: { state: 'none', msg: '', gameId: '' }
 };

@@ -752,3 +752,32 @@ textarea:focus {
     background-color: var(--accent-red);
     color: #fff;
 }
+
+/* Serverless role validation badge */
+.role-verify {
+    margin: 10px 0 0;
+    padding: 8px 10px;
+    border-radius: 8px;
+    font-size: 0.78rem;
+    line-height: 1.35;
+    text-align: left;
+    border: 1px solid transparent;
+}
+
+.role-verify.rv-ok {
+    color: var(--accent-green);
+    border-color: var(--accent-green);
+    background-color: rgba(76, 175, 80, 0.1);
+}
+
+.role-verify.rv-fail {
+    color: #fff;
+    font-weight: bold;
+    background-color: var(--accent-red);
+}
+
+.role-verify.rv-pending,
+.role-verify.rv-unavailable {
+    color: var(--text-dim);
+    border-color: var(--text-dim);
+}

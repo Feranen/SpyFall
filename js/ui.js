@@ -34,6 +34,7 @@ function applyState(s) {
         ui.secret = s.game.secretTarget;
         ui.starter = s.game.starter;
         ui.timer = { ms: s.game.timer.ms, paused: !!s.game.timer.paused, at: Date.now() };
+        verifyOwnRole(s).catch(e => console.warn('Role verification error:', e));
     }
     ui.voting = s.voting || null;
 
@@ -375,4 +376,5 @@ function setupRevealScreen(data) {
         $('xp-gain-notice').innerText = "Round result already counted.";
     }
     showScreen('screen-reveal');
+    verifyReveal(data, ui.gameId).catch(e => console.warn('Reveal verification error:', e));
 }

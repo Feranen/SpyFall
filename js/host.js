@@ -190,8 +190,10 @@ function buildStateFor(p, conn) {
 
     if (G.phase !== 'LOBBY') {
         const role = G.roles[p.accountId] || '';
+        s.commits = G.commits || {};                       // public: everyone sees every commitment
         s.game = {
             role,
+            salt: (G.salts && G.salts[p.accountId]) || '',   // private: only this player's own salt
             // The Spy must never receive the secret over the wire.
             secretTarget: role === 'SPY' ? null : G.secret,
             starter: G.starter,
@@ -350,7 +352,14 @@ function kickPlayer(accountId) {
 // =====================================================================
 // HOST: game actions (mutate G, then syncAll)
 // =====================================================================
-function hostStartGame() {
+let _startingRound = false;
+async function hostStartGame() {
+    if (_startingRound) return;                 // ignore double taps while hashing
+    _startingRound = true;
+    try { await hostStartGameInner(); } finally { _startingRound = false; }
+}
+
+async function hostStartGameInner() {
     if (!isHost || G.phase !== 'LOBBY') return;
     const spyCount = Math.min(3, Math.max(1, parseInt($('spy-count').value) || 1));
     const enableJester = $('enable-impostor').checked;
@@ -367,15 +376,30 @@ function hostStartGame() {
     }
     if (playerList.some(p => !p.isOnline) && !confirm("Some players are offline right now. Start anyway? (They can rejoin and will get their role.)")) return;
 
-    G.deck = [...preset.items];
-    G.facts = preset.facts || {};
-    G.secret = G.deck[Math.floor(Math.random() * G.deck.length)];
+    const deck = [...preset.items];
+    const secret = deck[Math.floor(Math.random() * deck.length)];
 
     const ids = shuffle(playerList.map(p => p.accountId));
-    G.roles = {};
-    ids.forEach(id => G.roles[id] = G.secret);
-    ids.slice(0, spyCount).forEach(id => G.roles[id] = 'SPY');
-    if (enableJester) G.roles[ids[spyCount]] = 'JESTER';
+    const roles = {};
+    ids.forEach(id => roles[id] = secret);
+    ids.slice(0, spyCount).forEach(id => roles[id] = 'SPY');
+    if (enableJester) roles[ids[spyCount]] = 'JESTER';
+
+    // Serverless role validation: commit to every role before anyone is shown theirs.
+    const gameId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    let rc = { salts: {}, commits: {} };
+    if (roleCryptoOk()) {
+        try { rc = await buildRoleCommitments(gameId, roles); }
+        catch (e) { console.warn('Role commitments failed; starting without verification:', e); }
+    }
+    if (!isHost || G.phase !== 'LOBBY') return;     // state changed while hashing
+
+    G.deck = deck;
+    G.facts = preset.facts || {};
+    G.secret = secret;
+    G.roles = roles;
+    G.salts = rc.salts;
+    G.commits = rc.commits;
 
     const online = playerList.filter(p => p.isOnline);
     G.starter = (online.length ? online : playerList)[Math.floor(Math.random() * (online.length || playerList.length))].name;
@@ -383,7 +407,7 @@ function hostStartGame() {
     G.votes = {};
     G.result = null;
     G.round++;
-    G.gameId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    G.gameId = gameId;
     G.phase = 'GAME';
     syncAll();
 }
@@ -412,12 +436,14 @@ function hostStartVoting() {
 function buildResult(winner, votedOutName) {
     const spies = [];
     let jester = null;
+    const reveal = {};      // accountId -> { role, salt }: lets every client re-check the round-start commitments
     playerList.forEach(p => {
         const r = G.roles[p.accountId];
         if (r === 'SPY') spies.push(p.name);
         if (r === 'JESTER') jester = p.name;
+        if (r) reveal[p.accountId] = { role: r, salt: (G.salts && G.salts[p.accountId]) || '' };
     });
-    return { secretTarget: G.secret, spies, jester, winner, votedOutName };
+    return { secretTarget: G.secret, spies, jester, winner, votedOutName, reveal };
 }
 
 function hostConcludeVoting() {
@@ -465,6 +491,8 @@ function hostReturnToLobby() {
     if (!isHost) return;
     G.phase = 'LOBBY';
     G.roles = {};
+    G.salts = {};
+    G.commits = {};
     G.votes = {};
     G.result = null;
     syncAll();
